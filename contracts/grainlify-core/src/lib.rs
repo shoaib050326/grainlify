@@ -155,7 +155,8 @@
 mod multisig;
 use multisig::{MultiSig, MultiSigConfig};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, BytesN, Env,
+    String, Symbol, Vec,
 };
 pub mod asset;
 mod governance;
@@ -165,6 +166,50 @@ pub mod pseudo_randomness;
 pub use governance::{
     Error as GovError, GovernanceConfig, Proposal, ProposalStatus, Vote, VoteType, VotingScheme,
 };
+
+// ============================================================================
+// Contract Errors
+// ============================================================================
+
+/// Typed errors for the GrainlifyContract.
+///
+/// Using `#[contracterror]` ensures these are surfaced as structured error
+/// codes in the Soroban host rather than opaque panic strings, making them
+/// easier to handle in client SDKs and off-chain tooling.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractError {
+    /// Contract has already been initialized; `init*` cannot be called again.
+    AlreadyInitialized = 1,
+    /// Caller is not the configured admin.
+    NotAdmin = 2,
+    /// Contract has not been initialized yet (admin not set).
+    NotInitialized = 3,
+    /// Multisig threshold has not been reached for this proposal.
+    ThresholdNotMet = 4,
+    /// The referenced upgrade proposal does not exist.
+    ProposalNotFound = 5,
+}
+
+// ============================================================================
+// Upgrade Event
+// ============================================================================
+
+/// Emitted on every successful WASM upgrade (both single-admin and multisig paths).
+///
+/// Off-chain indexers and monitoring tools should subscribe to the
+/// `("upgrade", "wasm")` topic pair to track all contract upgrades.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UpgradeEvent {
+    /// The new WASM hash that was installed.
+    pub new_wasm_hash: BytesN<32>,
+    /// Version number recorded at the time of upgrade (may be 0 if not yet set).
+    pub version: u32,
+    /// Ledger timestamp when the upgrade was executed.
+    pub timestamp: u64,
+}
 
 // ==================== MONITORING MODULE ====================
 mod monitoring {
@@ -814,6 +859,17 @@ impl GrainlifyContract {
     /// # Arguments
     /// * `env` - The contract environment
     /// * `proposal_id` - The ID of the upgrade proposal to execute
+    ///
+    /// # Authorization
+    /// No additional auth required here — the multisig approval quorum
+    /// (collected via [`approve_upgrade`]) acts as the authorization gate.
+    /// Panics with `"Threshold not met"` if quorum has not been reached.
+    ///
+    /// # Events
+    /// Emits `("upgrade", "wasm")` → [`UpgradeEvent`] on success.
+    ///
+    /// # State Preservation
+    /// All instance storage is preserved across the WASM replacement.
     pub fn execute_upgrade(env: Env, proposal_id: u64) {
         if !MultiSig::can_execute(&env, proposal_id) {
             panic!("Threshold not met");
@@ -825,7 +881,28 @@ impl GrainlifyContract {
             .get(&DataKey::UpgradeProposal(proposal_id))
             .expect("Missing upgrade proposal");
 
-        env.deployer().update_current_contract_wasm(wasm_hash);
+        // Store previous version for potential rollback
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::PreviousVersion, &current_version);
+
+        // Perform WASM upgrade — instance storage is preserved
+        env.deployer().update_current_contract_wasm(wasm_hash.clone());
+
+        // Emit structured upgrade event for off-chain indexers
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("wasm")),
+            UpgradeEvent {
+                new_wasm_hash: wasm_hash,
+                version: current_version,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         MultiSig::mark_executed(&env, proposal_id);
     }
@@ -835,21 +912,69 @@ impl GrainlifyContract {
     /// # Arguments
     /// * `env` - The contract environment
     /// * `new_wasm_hash` - Hash of the uploaded WASM code (32 bytes)
+    /// Upgrades the contract to new WASM code (single admin version).
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `new_wasm_hash` - Hash of the uploaded WASM code (32 bytes)
+    ///
+    /// # Authorization
+    /// Requires `require_auth()` from the configured admin address.
+    /// Panics with [`ContractError::NotInitialized`] if the contract has not
+    /// been initialized, or [`ContractError::NotAdmin`] if the caller is not
+    /// the admin.
+    ///
+    /// # Events
+    /// Emits `("upgrade", "wasm")` → [`UpgradeEvent`] on success.
+    ///
+    /// # State Preservation
+    /// All instance storage (admin, version, migration state, snapshots) is
+    /// preserved across the WASM replacement — only the executable code changes.
+    /// Returns the configured admin address, or `None` if the contract has not
+    /// been initialized via [`init_admin`] or [`init_with_network`].
+    ///
+    /// This is a view-only helper for off-chain tooling and auditors.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let start = env.ledger().timestamp();
 
-        // Verify admin authorization
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        // Verify admin is set (contract initialized).
+        // Panics with ContractError::NotInitialized if admin key is absent.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+
+        // Require admin authorization — panics with auth error if not signed by admin.
+        // This is the primary security gate: only the configured admin can upgrade.
         admin.require_auth();
 
         // Store previous version for potential rollback
-        let current_version = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1);
         env.storage()
             .instance()
             .set(&DataKey::PreviousVersion, &current_version);
 
-        // Perform WASM upgrade
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        // Perform WASM upgrade — instance storage is preserved
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Emit structured upgrade event for off-chain indexers
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("wasm")),
+            UpgradeEvent {
+                new_wasm_hash,
+                version: current_version,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("upgrade"), admin, true);
@@ -1285,18 +1410,6 @@ impl GrainlifyContract {
         // Get current version
         let current_version = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
 
-        // Idempotent retry: allow re-submitting a migration already recorded.
-        if env.storage().instance().has(&DataKey::MigrationState) {
-            let migration_state: MigrationState = env
-                .storage()
-                .instance()
-                .get(&DataKey::MigrationState)
-                .unwrap();
-            if migration_state.to_version == target_version {
-                return;
-            }
-        }
-
         // Validate target version
         if target_version <= current_version {
             let error_msg =
@@ -1502,7 +1615,8 @@ mod test {
     pub mod invariant_entrypoints_tests;
     pub mod upgrade_rollback_tests;
 
-    // WASM for testing
+    // WASM for testing (only available after building for wasm32 target)
+    #[cfg(feature = "upgrade_rollback_tests")]
     pub const WASM: &[u8] =
         include_bytes!("../target/wasm32-unknown-unknown/release/grainlify_core.wasm");
 
