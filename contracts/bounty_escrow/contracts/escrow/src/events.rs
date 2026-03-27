@@ -372,6 +372,26 @@ pub fn emit_fee_config_updated(env: &Env, event: FeeConfigUpdated) {
     env.events().publish(topics, event.clone());
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowArchived {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub timestamp: u64,
+}
+
+pub fn emit_archived(env: &Env, bounty_id: u64, timestamp: u64) {
+    let topics = (symbol_short!("archive"), bounty_id);
+    env.events().publish(
+        topics,
+        EscrowArchived {
+            version: EVENT_VERSION_V2,
+            bounty_id,
+            timestamp,
+        },
+    );
+}
+
 /// Payload for the [`emit_fee_routing_updated`] event.
 ///
 /// Emitted when a bounty-specific fee routing rule is set or changed.

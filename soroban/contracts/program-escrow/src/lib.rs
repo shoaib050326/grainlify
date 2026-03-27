@@ -1362,3 +1362,5 @@ mod test;
 mod test_ownership_transfer;
 #[cfg(test)]
 mod test_search;
+#[cfg(test)]
+mod test_full_lifecycle;
