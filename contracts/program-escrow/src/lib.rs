@@ -801,6 +801,7 @@ mod anti_abuse {
 
 mod claim_period;
 pub use claim_period::{ClaimRecord, ClaimStatus};
+mod gas_optimization;
 mod payout_splits;
 pub use payout_splits::{BeneficiarySplit, SplitConfig, SplitPayoutResult};
 #[cfg(test)]

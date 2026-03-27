@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 pub mod gas_budget;
+pub mod gas_optimization;
 #[cfg(test)]
 mod test_boundary_edge_cases;
 mod test_cross_contract_interface;
@@ -4589,25 +4590,6 @@ impl BountyEscrowContract {
             }
         }
 
-            Ok(locked_count)
-        })();
-
-        // Gas budget cap enforcement (test / testutils only).
-        #[cfg(any(test, feature = "testutils"))]
-        if result.is_ok() {
-            let gas_cfg = gas_budget::get_config(&env);
-            if let Err(e) = gas_budget::check(
-                &env,
-                symbol_short!("b_lock"),
-                &gas_cfg.batch_lock,
-                &gas_snapshot,
-                gas_cfg.enforce,
-            ) {
-                reentrancy_guard::release(&env);
-                return Err(e);
-            }
-        }
-
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         result
@@ -4791,171 +4773,27 @@ impl BountyEscrowContract {
                 },
             );
 
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
+            Ok(released_count)
+        })();
 
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
+        // Gas budget cap enforcement (test / testutils only).
+        #[cfg(any(test, feature = "testutils"))]
+        if result.is_ok() {
+            let gas_cfg = gas_budget::get_config(&env);
+            if let Err(e) = gas_budget::check(
+                &env,
+                symbol_short!("b_release"),
+                &gas_cfg.batch_release,
+                &gas_snapshot,
+                gas_cfg.enforce,
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
+        }
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.initializer_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Refunded;
-        refund_record.is_resolved = true;
-
-        emit!(RefundResolved {
-            bounty_id: escrow.bounty_id.clone(),
-            amount: escrow.amount,
-        });
-
-        Ok(())
+        // GUARD: release reentrancy lock
+        reentrancy_guard::release(&env);
+        result
     }
-}
-
-// --- ACCOUNT CONTEXTS AND TYPES ---
-
-#[derive(Accounts)]
-pub struct InitializeEscrow<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    pub mint: Account<'info, Mint>,
-    #[account(
-        mut,
-        constraint = initializer_token_account.mint == mint.key(),
-        constraint = initializer_token_account.owner == initializer.key()
-    )]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + EscrowAccount::LEN,
-        seeds = [b"escrow", initializer.key().as_ref(), bounty_id.as_bytes()],
-        bump
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        token::mint = mint,
-        token::authority = escrow,
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct CompleteBounty<'info> {
-    #[account(mut)]
-    pub contributor: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"escrow", escrow.initializer.as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-        has_one = initializer,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    /// CHECK: This is the original initializer of the escrow
-    pub initializer: AccountInfo<'info>,
-    #[account(
-        mut,
-        constraint = vault_token_account.owner == escrow.key()
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub contributor_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct SetRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + RefundRecord::LEN,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct TriggerRefund<'info> {
-    pub caller: Signer<'info>,
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-}
-
-#[derive(Accounts)]
-pub struct ResolveRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    #[account(mut)]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[account]
-pub struct RefundRecord {
-    pub escrow: Pubkey,
-    pub mode: RefundMode,
-    pub gas_budget: u64,
-    pub is_resolved: bool,
-}
-
-impl RefundRecord {
-    pub const LEN: usize = 32 + 1 + 8 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum RefundMode {
-    Oracle,
-    TimeBased,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-pub struct GasBudgetConfig {
-    pub max_gas: u64,
 }
