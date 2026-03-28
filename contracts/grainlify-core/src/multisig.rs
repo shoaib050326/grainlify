@@ -151,6 +151,7 @@ impl MultiSig {
         !proposal.executed && proposal.approvals.len() >= config.threshold
     }
 
+    /// Marks a proposal as executed after the guarded action succeeds.
     pub fn mark_executed(env: &Env, proposal_id: u64) {
         let mut proposal = Self::get_proposal(env, proposal_id);
 
@@ -172,7 +173,7 @@ impl MultiSig {
             .publish((symbol_short!("executed"),), proposal_id);
     }
 
-    /// Pauses multisig-protected execution paths.
+    /// Returns the current multisig configuration, if initialized.
     pub fn get_config_opt(env: &Env) -> Option<MultiSigConfig> {
         env.storage().instance().get(&DataKey::Config)
     }
@@ -214,7 +215,10 @@ impl MultiSig {
 
     /// Return whether the contract is currently paused.
     pub fn is_contract_paused(env: &Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Return whether the multisig configuration is structurally unsafe.
