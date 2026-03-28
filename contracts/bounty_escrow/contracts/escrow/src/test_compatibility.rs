@@ -56,15 +56,12 @@ fn test_all_error_codes_stable() {
     assert_eq!(Error::DeadlineNotPassed as u32, 6);
     assert_eq!(Error::Unauthorized as u32, 7);
     assert_eq!(Error::InvalidFeeRate as u32, 8);
-    assert_eq!(Error::FeeRecipientNotSet as u32, 9);
     assert_eq!(Error::InvalidBatchSize as u32, 10);
-    assert_eq!(Error::BatchSizeMismatch as u32, 11);
     assert_eq!(Error::DuplicateBountyId as u32, 12);
     assert_eq!(Error::InvalidAmount as u32, 13);
     assert_eq!(Error::InvalidDeadline as u32, 14);
     // 15 intentionally unassigned
     assert_eq!(Error::InsufficientFunds as u32, 16);
-    assert_eq!(Error::RefundNotApproved as u32, 17);
     assert_eq!(Error::FundsPaused as u32, 18);
     assert_eq!(Error::AmountBelowMinimum as u32, 19);
     assert_eq!(Error::AmountAboveMaximum as u32, 20);

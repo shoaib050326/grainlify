@@ -634,9 +634,7 @@ pub enum Error {
     DeadlineNotPassed = 6,
     Unauthorized = 7,
     InvalidFeeRate = 8,
-    FeeRecipientNotSet = 9,
     InvalidBatchSize = 10,
-    BatchSizeMismatch = 11,
     DuplicateBountyId = 12,
     /// Returned when amount is invalid (zero, negative, or exceeds available)
     InvalidAmount = 13,
@@ -645,7 +643,6 @@ pub enum Error {
     /// Returned when contract has insufficient funds for the operation
     InsufficientFunds = 16,
     /// Returned when refund is attempted without admin approval
-    RefundNotApproved = 17,
     FundsPaused = 18,
     /// Returned when lock amount is below the configured policy minimum (Issue #62)
     AmountBelowMinimum = 19,
