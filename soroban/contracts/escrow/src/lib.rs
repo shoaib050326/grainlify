@@ -19,9 +19,8 @@ const MAX_PAGE_SIZE: u32 = 50;
 pub const DELEGATE_PERMISSION_RELEASE: u32 = 1 << 0;
 pub const DELEGATE_PERMISSION_REFUND: u32 = 1 << 1;
 pub const DELEGATE_PERMISSION_UPDATE_META: u32 = 1 << 2;
-pub const DELEGATE_PERMISSION_MASK: u32 = DELEGATE_PERMISSION_RELEASE
-    | DELEGATE_PERMISSION_REFUND
-    | DELEGATE_PERMISSION_UPDATE_META;
+pub const DELEGATE_PERMISSION_MASK: u32 =
+    DELEGATE_PERMISSION_RELEASE | DELEGATE_PERMISSION_REFUND | DELEGATE_PERMISSION_UPDATE_META;
 
 mod identity;
 pub use identity::*;
@@ -52,6 +51,8 @@ pub enum Error {
     TransactionExceedsLimit = 305,
     InvalidRiskScore = 306,
     InvalidTier = 307,
+    InvalidDelegatePermissions = 308,
+    InvalidDelegateTarget = 309,
 }
 
 #[contracttype]
@@ -72,6 +73,9 @@ pub struct Escrow {
     pub deadline: u64,
     pub jurisdiction: OptionalJurisdiction,
     pub labels: Vec<String>,
+    pub delegate: Option<Address>,
+    pub delegate_permissions: u32,
+    pub metadata: Option<String>,
 }
 
 #[contracttype]
@@ -233,7 +237,9 @@ impl EscrowContract {
             .get(&DataKey::EscrowIndex)
             .unwrap_or_else(|| Vec::new(env));
         index.push_back(bounty_id);
-        env.storage().persistent().set(&DataKey::EscrowIndex, &index);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowIndex, &index);
     }
 
     /// Initialize with admin and token. Call once.
@@ -257,8 +263,16 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Set or update an authorized claim issuer (admin only)
-    pub fn set_authorized_issuer(env: Env, issuer: Address, authorized: bool) -> Result<(), Error> {
+    /// Set or update an authorized claim issuer (admin only).
+    ///
+    /// The issuer's Ed25519 public key is bound to the issuer Address at
+    /// authorization time to prevent claims signed with an attacker key.
+    pub fn set_authorized_issuer(
+        env: Env,
+        issuer: Address,
+        issuer_pubkey: BytesN<32>,
+        authorized: bool,
+    ) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
@@ -266,9 +280,15 @@ impl EscrowContract {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthorizedIssuer(issuer.clone()), &authorized);
+        if authorized {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AuthorizedIssuer(issuer.clone()), &issuer_pubkey);
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AuthorizedIssuer(issuer.clone()));
+        }
 
         // Emit event for issuer management
         env.events().publish(
@@ -335,12 +355,15 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Submit an identity claim for verification and storage
+    /// Submit an identity claim for verification and storage.
+    ///
+    /// The issuer's Ed25519 public key is looked up from the on-chain
+    /// authorization store, closing the spoofing vector where a claim could
+    /// reference an authorized issuer but supply a different signing key.
     pub fn submit_identity_claim(
         env: Env,
         claim: IdentityClaim,
         signature: BytesN<64>,
-        issuer_pubkey: BytesN<32>,
     ) -> Result<(), Error> {
         // Require authentication from the address in the claim
         claim.address.require_auth();
@@ -362,23 +385,16 @@ impl EscrowContract {
             return Err(Error::ClaimExpired);
         }
 
-        // Check if issuer is authorized
-        let is_authorized: bool = env
+        // Look up the issuer's bound public key from storage.
+        let issuer_pubkey: BytesN<32> = env
             .storage()
             .persistent()
             .get(&DataKey::AuthorizedIssuer(claim.issuer.clone()))
-            .unwrap_or(false);
+            .ok_or(Error::UnauthorizedIssuer)?;
 
-        if !is_authorized {
-            env.events().publish(
-                (soroban_sdk::symbol_short!("claim"), claim.address.clone()),
-                soroban_sdk::symbol_short!("unauth"),
-            );
-            return Err(Error::UnauthorizedIssuer);
-        }
-
-        // Verify claim signature
-        identity::verify_claim_signature(&env, &claim, &signature, &issuer_pubkey)?;
+        // ed25519_verify panics on invalid signatures; the host surfaces that
+        // as a failed transaction.
+        identity::verify_claim_signature(&env, &claim, &signature, &issuer_pubkey);
 
         // Store identity data for the address
         let now = env.ledger().timestamp();
@@ -526,7 +542,9 @@ impl EscrowContract {
             .as_ref()
             .map(|delegate| delegate == caller)
             .unwrap_or(false);
-        if delegate_matches && (escrow.delegate_permissions & required_permission) == required_permission {
+        if delegate_matches
+            && (escrow.delegate_permissions & required_permission) == required_permission
+        {
             return Ok(());
         }
 
@@ -620,6 +638,9 @@ impl EscrowContract {
             deadline,
             jurisdiction: jurisdiction.clone(),
             labels: Vec::new(&env),
+            delegate: None,
+            delegate_permissions: 0,
+            metadata: None,
         };
         env.storage()
             .persistent()
@@ -685,6 +706,7 @@ impl EscrowContract {
         Self::release_funds_by(env, admin, bounty_id, contributor)
     }
 
+    /// Release funds to contributor directly by an authorized actor.
     pub fn release_funds_by(
         env: Env,
         caller: Address,
@@ -704,6 +726,12 @@ impl EscrowContract {
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
         Self::require_escrow_actor(&env, &escrow, &caller, DELEGATE_PERMISSION_RELEASE)?;
+        if let OptionalJurisdiction::Some(config) = &escrow.jurisdiction {
+            if config.release_paused {
+                reentrancy_guard::release(&env);
+                return Err(Error::Unauthorized);
+            }
+        }
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -765,6 +793,12 @@ impl EscrowContract {
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
         Self::require_escrow_actor(&env, &escrow, &caller, DELEGATE_PERMISSION_REFUND)?;
+        if let OptionalJurisdiction::Some(config) = &escrow.jurisdiction {
+            if config.refund_paused {
+                reentrancy_guard::release(&env);
+                return Err(Error::Unauthorized);
+            }
+        }
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -924,7 +958,9 @@ impl EscrowContract {
             restricted,
             allowed_labels: allowed_labels.clone(),
         };
-        env.storage().persistent().set(&DataKey::LabelConfig, &config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LabelConfig, &config);
         env.events().publish(
             (LABEL_CONFIG_UPDATED,),
             LabelConfigUpdatedEvent {
@@ -1142,3 +1178,4 @@ pub mod traits {
 mod identity_test;
 mod test;
 mod test_dispute_resolution;
+mod test_max_counts;

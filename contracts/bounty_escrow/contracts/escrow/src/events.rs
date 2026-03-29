@@ -29,8 +29,8 @@
 //!   (Checks-Effects-Interactions ordering) so they accurately reflect final
 //!   on-chain state.
 //! * No PII, KYC data, or private keys are ever emitted.
-//! * All `symbol_short!` strings are ≤ 8 bytes — Soroban silently truncates
-//!   longer strings, which would corrupt topic-based filtering.
+//! * All `symbol_short!` strings are ≤ 9 bytes — Soroban rejects longer values,
+//!   which would corrupt topic-based filtering.
 use crate::CapabilityAction;
 use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
 
@@ -163,6 +163,51 @@ pub struct FundsReleased {
 /// Emit [`FundsReleased`].
 pub fn emit_funds_released(env: &Env, event: FundsReleased) {
     let topics = (symbol_short!("f_rel"), event.bounty_id);
+    env.events().publish(topics, event.clone());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESCROW PUBLISHED EVENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Payload for the [`emit_escrow_published`] event.
+///
+/// Emitted when an escrow transitions from `Draft` to `Locked` status via
+/// the `publish()` function. This indicates the escrow is now active and
+/// funds can be released or refunded.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"pub"` |
+/// | 1 | `bounty_id` |
+///
+/// ### Data fields
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `version` | `u32` | Always [`EVENT_VERSION_V2`] |
+/// | `bounty_id` | `u64` | The bounty identifier |
+/// | `published_by` | `Address` | Address that published the escrow |
+/// | `timestamp` | `u64` | Ledger time of publication |
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowPublished {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub published_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`EscrowPublished`].
+///
+/// # Arguments
+/// * `env`   — Soroban execution environment.
+/// * `event` — Pre-constructed event payload.
+///
+/// # Panics
+/// Never panics; publishing is infallible in Soroban.
+pub fn emit_escrow_published(env: &Env, event: EscrowPublished) {
+    let topics = (symbol_short!("pub"), event.bounty_id);
     env.events().publish(topics, event.clone());
 }
 
@@ -885,7 +930,7 @@ pub fn emit_pause_state_changed(env: &Env, event: crate::PauseStateChanged) {
 /// | 0 | `"em_wtd"` |
 ///
 /// ### Security notes
-/// - This function can only be called when `lock_paused = true`,
+/// Returns `Error::UpgradeSafetyFailed` when blocking safety findings = true`,
 ///   ensuring depositors have visible warning before a drain is possible.
 /// - The `amount` field reflects the **entire** contract balance at the
 ///   time of withdrawal, which may cover multiple open escrows.
@@ -1067,4 +1112,139 @@ pub struct GasBudgetCapExceeded {
     pub mem_cap: u64,
     /// Ledger timestamp at the time of the check.
     pub timestamp: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMELOCK EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Payload for the [`emit_timelock_configured`] event.
+///
+/// Emitted when the admin configures the timelock settings.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"timelock_cfg"` |
+///
+/// ### Data fields
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `version` | `u32` | Always [`EVENT_VERSION_V2`] |
+/// | `delay` | `u64` | Configured timelock delay in seconds |
+/// | `is_enabled` | `bool` | Whether timelock is enabled |
+/// | `configured_by` | `Address` | Admin who configured the timelock |
+/// | `timestamp` | `u64` | Ledger time of configuration |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockConfigured {
+    pub version: u32,
+    pub delay: u64,
+    pub is_enabled: bool,
+    pub configured_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`TimelockConfigured`].
+pub fn emit_timelock_configured(env: &Env, event: TimelockConfigured) {
+    let topics = (symbol_short!("tmlk_cfg"),);
+    env.events().publish(topics, event);
+}
+
+/// Payload for the [`emit_admin_action_proposed`] event.
+///
+/// Emitted when an admin proposes a delayed action.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"act_prop"` |
+/// | 1 | `action_id: u64` |
+///
+/// ### Data fields
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `version` | `u32` | Always [`EVENT_VERSION_V2`] |
+/// | `action_type` | `ActionType` | Type of admin action |
+/// | `execute_after` | `u64` | Timestamp when action becomes executable |
+/// | `proposed_by` | `Address` | Admin who proposed the action |
+/// | `timestamp` | `u64` | Ledger time of proposal |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminActionProposed {
+    pub version: u32,
+    pub action_type: crate::ActionType,
+    pub execute_after: u64,
+    pub proposed_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`AdminActionProposed`].
+pub fn emit_admin_action_proposed(env: &Env, event: AdminActionProposed) {
+    let topics = (symbol_short!("act_prop"),);
+    env.events().publish(topics, event);
+}
+
+/// Payload for the [`emit_admin_action_executed`] event.
+///
+/// Emitted when a proposed admin action is executed.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"act_exec"` |
+/// | 1 | `action_id: u64` |
+///
+/// ### Data fields
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `version` | `u32` | Always [`EVENT_VERSION_V2`] |
+/// | `action_type` | `ActionType` | Type of admin action |
+/// | `executed_by` | `Address` | Address that executed the action |
+/// | `executed_at` | `u64` | Ledger time of execution |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminActionExecuted {
+    pub version: u32,
+    pub action_type: crate::ActionType,
+    pub executed_by: Address,
+    pub executed_at: u64,
+}
+
+/// Emit [`AdminActionExecuted`].
+pub fn emit_admin_action_executed(env: &Env, event: AdminActionExecuted) {
+    let topics = (symbol_short!("act_exec"),);
+    env.events().publish(topics, event);
+}
+
+/// Payload for the [`emit_admin_action_cancelled`] event.
+///
+/// Emitted when an admin cancels a pending action.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"act_cncl"` |
+/// | 1 | `action_id: u64` |
+///
+/// ### Data fields
+/// | Field | Type | Description |
+/// |-------|------|-------------|
+/// | `version` | `u32` | Always [`EVENT_VERSION_V2`] |
+/// | `action_type` | `ActionType` | Type of admin action |
+/// | `cancelled_by` | `Address` | Admin who cancelled the action |
+/// | `cancelled_at` | `u64` | Ledger time of cancellation |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminActionCancelled {
+    pub version: u32,
+    pub action_type: crate::ActionType,
+    pub cancelled_by: Address,
+    pub cancelled_at: u64,
+}
+
+/// Emit [`AdminActionCancelled`].
+pub fn emit_admin_action_cancelled(env: &Env, event: AdminActionCancelled) {
+    let topics = (symbol_short!("act_cncl"),);
+    env.events().publish(topics, event);
 }

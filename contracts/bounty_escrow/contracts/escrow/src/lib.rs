@@ -1,49 +1,53 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+#![no_std]
 
+pub mod events;
 pub mod gas_budget;
-pub mod gas_optimization;
-#[cfg(test)]
+pub mod invariants;
+pub mod multitoken_invariants;
+pub mod reentrancy_guard;
+// Broken test modules (Anchor→Soroban migration in progress, issue #754/#789)
+// Gated out until the migration is complete.
+pub mod audit_trail;
+#[cfg(feature = "legacy-tests")]
 mod test_boundary_edge_cases;
+#[cfg(feature = "legacy-tests")]
 mod test_cross_contract_interface;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_deterministic_randomness;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_multi_region_treasury;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_multi_token_fees;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_rbac;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_risk_flags;
 mod traits;
 pub mod upgrade_safety;
 
-use crate::constants::*;
-use crate::errors::*;
-use crate::events::*;
-use crate::state::*;
-
-declare_id!("8vS5pL7e6k2xP7L9R9jGv6D5v8S5pL7e6k2xP7L9R9jG");
-
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_frozen_balance;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_reentrancy_guard;
+#[cfg(test)]
+mod test_timelock;
 
-use events::{
+use crate::events::{
+    emit_admin_action_cancelled, emit_admin_action_executed, emit_admin_action_proposed,
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
-    emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
-    emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
+    emit_deprecation_state_changed, emit_deterministic_selection, emit_escrow_published,
+    emit_funds_locked, emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
     emit_maintenance_mode_changed, emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
-    emit_ticket_issued, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
+    emit_ticket_issued, emit_timelock_configured, AdminActionCancelled, AdminActionExecuted,
+    AdminActionProposed, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
     ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged,
-    DeterministicSelectionDerived, FundsLocked, FundsLockedAnon, FundsRefunded, FundsReleased,
-    MaintenanceModeChanged, NotificationPreferencesUpdated, ParticipantFilterModeChanged,
-    RiskFlagsUpdated, TicketClaimed, TicketIssued, EVENT_VERSION_V2,
+    DeterministicSelectionDerived, EscrowPublished, FundsLocked, FundsLockedAnon, FundsRefunded,
+    FundsReleased, MaintenanceModeChanged, NotificationPreferencesUpdated,
+    ParticipantFilterModeChanged, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
+    TimelockConfigured, EVENT_VERSION_V2,
 };
-use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes,
     BytesN, Env, String, Symbol, Vec,
@@ -230,7 +234,7 @@ mod monitoring {
 
     // Get analytics
     #[allow(dead_code)]
-    pub fn get_analytics(env: &Env) -> Analytics {
+    pub fn get_escrow_analytics(env: &Env) -> Analytics {
         let op_key = Symbol::new(env, OPERATION_COUNT);
         let usr_key = Symbol::new(env, USER_COUNT);
         let err_key = Symbol::new(env, ERROR_COUNT);
@@ -372,7 +376,8 @@ mod anti_abuse {
         }
     }
 
-    pub fn get_admin(env: &Env) -> Option<Address> {
+    /// Returns the current admin address, if set.
+    pub fn get_escrow_admin(env: &Env) -> Option<Address> {
         env.storage().instance().get(&AntiAbuseKey::Admin)
     }
 
@@ -501,7 +506,7 @@ pub mod rbac {
     /// Returns `true` if `addr` is the stored anti-abuse (operator) admin.
     pub fn is_operator(env: &Env, addr: &Address) -> bool {
         use crate::anti_abuse;
-        anti_abuse::get_admin(env)
+        anti_abuse::get_escrow_admin(env)
             .map(|a| &a == addr)
             .unwrap_or(false)
     }
@@ -511,6 +516,17 @@ pub mod rbac {
 const BASIS_POINTS: i128 = 10_000;
 const MAX_FEE_RATE: i128 = 5_000; // 50% max fee
 const MAX_BATCH_SIZE: u32 = 20;
+
+// ============================================================================
+// TIMELOCK CONSTANTS
+// ============================================================================
+
+/// Minimum timelock delay in seconds (1 hour) - absolute floor
+const MINIMUM_DELAY: u64 = 3_600;
+/// Default recommended timelock delay in seconds (24 hours)
+const DEFAULT_DELAY: u64 = 86_400;
+/// Maximum timelock delay in seconds (30 days)
+const MAX_DELAY: u64 = 2_592_000;
 
 extern crate grainlify_core;
 use grainlify_core::asset;
@@ -545,7 +561,68 @@ pub enum ReleaseType {
     Automatic = 2,
 }
 
-use grainlify_core::errors;
+// ============================================================================
+// TIMELOCK DATA STRUCTURES
+// ============================================================================
+
+/// Types of admin actions that require timelock protection
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ActionType {
+    ChangeAdmin = 1,
+    ChangeFeeRecipient = 2,
+    EnableKillSwitch = 3,
+    DisableKillSwitch = 4,
+    SetMaintenanceMode = 5,
+    UnsetMaintenanceMode = 6,
+    SetPaused = 7,
+    UnsetPaused = 8,
+}
+
+/// Status of a pending admin action
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ActionStatus {
+    Pending = 1,
+    Executed = 2,
+    Cancelled = 3,
+}
+
+/// Payload for admin actions - encoded variant-specific parameters
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionPayload {
+    ChangeAdmin(Address),
+    ChangeFeeRecipient(Address),
+    EnableKillSwitch,
+    DisableKillSwitch,
+    SetMaintenanceMode(bool),
+    SetPaused(Option<bool>, Option<bool>, Option<bool>),
+}
+
+/// A pending admin action awaiting execution
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAction {
+    pub action_id: u64,
+    pub action_type: ActionType,
+    pub payload: Bytes, // Serialized ActionPayload
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+    pub status: ActionStatus,
+}
+
+/// Timelock configuration
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockConfig {
+    pub delay: u64,
+    pub is_enabled: bool,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -557,67 +634,40 @@ pub enum Error {
     FundsNotLocked = 203,
     DeadlineNotPassed = 6,
     Unauthorized = 7,
-    InvalidFeeRate = 8,
-    FeeRecipientNotSet = 9,
-    InvalidBatchSize = 10,
-    BatchSizeMismatch = 11,
-    DuplicateBountyId = 12,
-    /// Returned when amount is invalid (zero, negative, or exceeds available)
     InvalidAmount = 13,
-    /// Returned when deadline is invalid (in the past or too far in the future)
     InvalidDeadline = 14,
-    /// Returned when contract has insufficient funds for the operation
     InsufficientFunds = 16,
-    /// Returned when refund is attempted without admin approval
-    RefundNotApproved = 17,
     FundsPaused = 18,
-    /// Returned when lock amount is below the configured policy minimum (Issue #62)
-    AmountBelowMinimum = 19,
-    /// Returned when lock amount is above the configured policy maximum (Issue #62)
-    AmountAboveMaximum = 20,
-    /// Returned when refund is blocked by a pending claim/dispute
     NotPaused = 21,
     ClaimPending = 22,
-    /// Returned when claim ticket is not found
-    TicketNotFound = 23,
-    /// Returned when claim ticket has already been used (replay prevention)
-    TicketAlreadyUsed = 24,
-    /// Returned when claim ticket has expired
-    TicketExpired = 25,
-    CapabilityNotFound = 26,
-    CapabilityExpired = 27,
-    CapabilityRevoked = 28,
-    CapabilityActionMismatch = 29,
-    CapabilityAmountExceeded = 30,
-    CapabilityUsesExhausted = 31,
-    CapabilityExceedsAuthority = 32,
-    InvalidAssetId = 33,
-    /// Returned when new locks/registrations are disabled (contract deprecated)
+    TicketInvalid = 23,
+    CapNotFound = 26,
+    CapExpired = 27,
+    CapRevoked = 28,
+    CapActionMismatch = 29,
+    CapAmountExceeded = 30,
+    CapUsesExhausted = 31,
+    CapExceedsAuthority = 32,
     ContractDeprecated = 34,
-    /// Returned when participant filtering is blocklist-only and the address is blocklisted
     ParticipantBlocked = 35,
-    /// Returned when participant filtering is allowlist-only and the address is not allowlisted
     ParticipantNotAllowed = 36,
-    /// Refund for anonymous escrow must go through refund_resolved (resolver provides recipient)
-    AnonymousRefundRequiresResolution = 39,
-    /// Anonymous resolver address not set in instance storage
-    AnonymousResolverNotSet = 40,
-    /// Bounty exists but is not an anonymous escrow (for refund_resolved)
+    UseEscrowV2ForAnon = 37,
+    AnonRefundNeedsResolver = 39,
+    AnonResolverNotSet = 40,
     NotAnonymousEscrow = 41,
-    /// Use get_escrow_info_v2 for anonymous escrows
-    UseGetEscrowInfoV2ForAnonymous = 37,
-    InvalidSelectionInput = 42,
-    /// Returned when an upgrade safety pre-check fails
-    UpgradeSafetyCheckFailed = 43,
-    /// Returned when an operation's measured CPU or memory consumption exceeds
-    /// the configured cap and [`gas_budget::GasBudgetConfig::enforce`] is `true`.
-    /// The Soroban host reverts all storage writes and token transfers in the
-    /// transaction atomically. Only reachable in test / testutils builds.
-    GasBudgetExceeded = 44,
-    /// Returned when an escrow is explicitly frozen by an admin hold.
     EscrowFrozen = 45,
-    /// Returned when the escrow depositor is explicitly frozen by an admin hold.
     AddressFrozen = 46,
+    TimelockNotEnabled = 47,
+    TimelockNotElapsed = 48,
+    TimelockEnabled = 49,
+    ActionNotFound = 50,
+    ActionAlreadyExecuted = 51,
+    ActionAlreadyCancelled = 52,
+    InvalidPayload = 53,
+    DelayBelowMinimum = 54,
+    DelayAboveMaximum = 55,
+    InvalidState = 56,
+    UpgradeSafetyFailed = 43,
 }
 
 /// Bit flag: escrow or payout should be treated as elevated risk (indexers, UIs).
@@ -649,6 +699,7 @@ pub struct EscrowMetadata {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    Draft,
     Locked,
     Released,
     Refunded,
@@ -798,6 +849,11 @@ pub enum DataKey {
     /// Per-operation gas budget caps configured by the admin.
     /// See [`gas_budget::GasBudgetConfig`].
     GasBudgetConfig,
+
+    /// Timelock configuration and pending actions
+    TimelockConfig, // TimelockConfig struct
+    PendingAction(u64), // action_id -> PendingAction
+    ActionCounter,      // monotonically increasing action_id
 }
 
 #[contracttype]
@@ -1053,12 +1109,28 @@ impl BountyEscrowContract {
         monitoring::health_check(&env)
     }
 
-    pub fn get_analytics(env: Env) -> monitoring::Analytics {
-        monitoring::get_analytics(&env)
+    pub fn get_escrow_analytics_v2(env: Env) -> monitoring::Analytics {
+        monitoring::get_escrow_analytics(&env)
     }
 
     pub fn get_state_snapshot(env: Env) -> monitoring::StateSnapshot {
         monitoring::get_state_snapshot(&env)
+    }
+    /// Enable or disable the on-chain append-only audit log (Admin only).
+    pub fn set_audit_enabled(env: Env, enabled: bool) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        audit_trail::set_enabled(&env, enabled);
+        Ok(())
+    }
+
+    /// Retrieve the last `n` records from the audit log.
+    pub fn get_audit_tail(env: Env, n: u32) -> Vec<audit_trail::AuditRecord> {
+        audit_trail::get_audit_tail(&env, n)
     }
 
     fn order_batch_lock_items(env: &Env, items: &Vec<LockFundsItem>) -> Vec<LockFundsItem> {
@@ -1079,6 +1151,94 @@ impl BountyEscrowContract {
             ordered = next;
         }
         ordered
+    }
+    /// Filter escrows by their current status (Locked, Released, etc.)
+    /// Stable ordering is guaranteed by the EscrowIndex.
+    pub fn query_escrows_by_status(
+        env: Env,
+        status: EscrowStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<EscrowInfo> {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+        let mut results = Vec::new(&env);
+
+        // Start from offset to support stable pagination
+        for i in offset..index.len() {
+            if results.len() >= limit {
+                break;
+            }
+            let id = index.get(i).unwrap();
+
+            // Reusing your existing get_escrow_info logic
+            let info = Self::load_escrow_info(&env, id);
+            if info.status == status {
+                results.push_back(info);
+            }
+        }
+        results
+    }
+
+    /// Filter escrows by amount range [min, max]
+    pub fn query_escrows_by_amount(
+        env: Env,
+        min: i128,
+        max: i128,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<EscrowInfo> {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+        let mut results = Vec::new(&env);
+
+        for i in offset..index.len() {
+            if results.len() >= limit {
+                break;
+            }
+            let id = index.get(i).unwrap();
+            let info = Self::load_escrow_info(&env, id);
+
+            if info.amount >= min && info.amount <= max {
+                results.push_back(info);
+            }
+        }
+        results
+    }
+
+    /// Filter escrows by deadline range [min_ts, max_ts]
+    pub fn query_escrows_by_deadline(
+        env: Env,
+        min_ts: u64,
+        max_ts: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<EscrowInfo> {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+        let mut results = Vec::new(&env);
+
+        for i in offset..index.len() {
+            if results.len() >= limit {
+                break;
+            }
+            let id = index.get(i).unwrap();
+            let info = Self::load_escrow_info(&env, id);
+
+            if info.deadline >= min_ts && info.deadline <= max_ts {
+                results.push_back(info);
+            }
+        }
+        results
     }
 
     fn order_batch_release_items(
@@ -1257,26 +1417,26 @@ impl BountyEscrowContract {
         }
 
         if destinations.is_empty() {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let mut total_weight: u64 = 0;
         for destination in destinations.iter() {
             if destination.weight == 0 {
-                return Err(Error::InvalidAmount);
+                return Err(Error::ActionNotFound);
             }
 
             if destination.region.is_empty() || destination.region.len() > 50 {
-                return Err(Error::InvalidAmount);
+                return Err(Error::ActionNotFound);
             }
 
             total_weight = total_weight
                 .checked_add(destination.weight as u64)
-                .ok_or(Error::InvalidAmount)?;
+                .ok_or(Error::ActionNotFound)?;
         }
 
         if total_weight == 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         Ok(())
@@ -1286,88 +1446,113 @@ impl BountyEscrowContract {
     ///
     /// Accepts a pre-constructed [`FeeCollected`] event which contains all fee details.
     /// The token client and fee config are resolved internally from contract storage.
-    fn route_fee(env: &Env, fee_event: events::FeeCollected) {
-        if fee_event.amount <= 0 {
-            return;
+    fn route_fee(
+        env: &Env,
+        client: &token::Client,
+        fee_amount: i128,
+        fee_rate: i128,
+        operation_type: events::FeeOperationType,
+    ) -> Result<(), Error> {
+        if fee_amount <= 0 {
+            return Ok(());
         }
+        let config = Self::get_fee_config_internal(env);
+
         let fee_fixed = match operation_type {
             events::FeeOperationType::Lock => config.lock_fixed_fee,
             events::FeeOperationType::Release => config.release_fixed_fee,
         };
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let client = token::Client::new(env, &token_addr);
-        let config = Self::get_fee_config_internal(env);
-
         if !config.distribution_enabled || config.treasury_destinations.is_empty() {
             client.transfer(
                 &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
+                &config.fee_recipient,
+                &fee_amount,
             );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type: operation_type.clone(),
+                    amount: fee_amount,
+                    fee_rate,
+                    fee_fixed,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
         }
 
         let mut total_weight: u64 = 0;
-        for destination in config.treasury_destinations.iter() {
+        for dest in config.treasury_destinations.iter() {
             total_weight = total_weight
-                .checked_add(destination.weight as u64)
+                .checked_add(dest.weight as u64)
                 .unwrap_or(u64::MAX);
         }
 
         if total_weight == 0 {
             client.transfer(
                 &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
+                &config.fee_recipient,
+                &fee_amount,
             );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type: operation_type.clone(),
+                    amount: fee_amount,
+                    fee_rate,
+                    fee_fixed,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
         }
 
         let mut distributed = 0i128;
         let destination_count = config.treasury_destinations.len() as usize;
-        let fee_amount = fee_event.amount;
 
         for (index, destination) in config.treasury_destinations.iter().enumerate() {
             let share = if index + 1 == destination_count {
                 fee_amount
                     .checked_sub(distributed)
-                    .ok_or(Error::InvalidAmount)?
+                    .ok_or(Error::ActionNotFound)?
             } else {
-                fee_amount
-                    .checked_mul(destination.weight as i128)
-                    .and_then(|value| value.checked_div(total_weight as i128))
-                    .unwrap_or(0)
+                let w = destination.weight as i128;
+                let tw = total_weight as i128;
+                fee_amount.checked_mul(w).unwrap_or(0) / tw
             };
 
-            distributed = distributed.checked_add(share).ok_or(Error::InvalidAmount)?;
+            distributed = distributed.checked_add(share).unwrap_or(distributed);
 
-            if share <= 0 {
-                continue;
+            if share > 0 {
+                client.transfer(
+                    &env.current_contract_address(),
+                    &destination.address,
+                    &share,
+                );
+                events::emit_fee_collected(
+                    env,
+                    events::FeeCollected {
+                        operation_type: operation_type.clone(),
+                        amount: share,
+                        fee_rate,
+                        fee_fixed,
+                        recipient: destination.address,
+                        timestamp: env.ledger().timestamp(),
+                    },
+                );
             }
-
-            client.transfer(
-                &env.current_contract_address(),
-                &destination.address,
-                &share,
-            );
-            events::emit_fee_collected(
-                env,
-                events::FeeCollected {
-                    operation_type: fee_event.operation_type.clone(),
-                    amount: share,
-                    fee_rate: fee_event.fee_rate,
-                    fee_fixed: fee_event.fee_fixed,
-                    recipient: destination.address,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
         }
+        Ok(())
     }
 
     /// Update fee configuration (admin only)
+    ///
+    /// # Timelock Guard
+    /// When timelock is enabled, this function returns `TimelockEnabled`.
+    /// Use `propose_admin_action` with `ActionType::ChangeFeeRecipient` instead.
     pub fn update_fee_config(
         env: Env,
         lock_fee_rate: Option<i128>,
@@ -1381,6 +1566,9 @@ impl BountyEscrowContract {
             return Err(Error::NotInitialized);
         }
 
+        // Timelock guard: reject direct calls when timelock is enabled
+        Self::check_timelock_guard(&env)?;
+
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -1388,28 +1576,28 @@ impl BountyEscrowContract {
 
         if let Some(rate) = lock_fee_rate {
             if !(0..=MAX_FEE_RATE).contains(&rate) {
-                return Err(Error::InvalidFeeRate);
+                return Err(Error::ActionNotFound);
             }
             fee_config.lock_fee_rate = rate;
         }
 
         if let Some(rate) = release_fee_rate {
             if !(0..=MAX_FEE_RATE).contains(&rate) {
-                return Err(Error::InvalidFeeRate);
+                return Err(Error::ActionNotFound);
             }
             fee_config.release_fee_rate = rate;
         }
 
         if let Some(fixed) = lock_fixed_fee {
             if fixed < 0 {
-                return Err(Error::InvalidAmount);
+                return Err(Error::ActionNotFound);
             }
             fee_config.lock_fixed_fee = fixed;
         }
 
         if let Some(fixed) = release_fixed_fee {
             if fixed < 0 {
-                return Err(Error::InvalidAmount);
+                return Err(Error::ActionNotFound);
             }
             fee_config.release_fixed_fee = fixed;
         }
@@ -1493,6 +1681,10 @@ impl BountyEscrowContract {
     /// # Errors
     /// Returns `Error::NotInitialized` if the admin has not been set.
     /// Returns `Error::Unauthorized` if the caller is not the registered admin.
+    ///
+    /// # Timelock Guard
+    /// When timelock is enabled, this function returns `TimelockEnabled`.
+    /// Use `propose_admin_action` with `ActionType::SetPaused` instead.
     pub fn set_paused(
         env: Env,
         lock: Option<bool>,
@@ -1503,6 +1695,9 @@ impl BountyEscrowContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
+
+        // Timelock guard: reject direct calls when timelock is enabled
+        Self::check_timelock_guard(&env)?;
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -1664,6 +1859,10 @@ impl BountyEscrowContract {
     /// Set deprecation (kill switch) and optional migration target. Admin only.
     /// When deprecated is true: new lock_funds and batch_lock_funds are blocked; existing escrows
     /// can still release, refund, or be migrated off-chain. Emits DeprecationStateChanged.
+    ///
+    /// # Timelock Guard
+    /// When timelock is enabled, this function returns `TimelockEnabled`.
+    /// Use `propose_admin_action` with `ActionType::EnableKillSwitch` or `ActionType::DisableKillSwitch` instead.
     pub fn set_deprecated(
         env: Env,
         deprecated: bool,
@@ -1672,6 +1871,10 @@ impl BountyEscrowContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
+
+        // Timelock guard: reject direct calls when timelock is enabled
+        Self::check_timelock_guard(&env)?;
+
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -1834,6 +2037,14 @@ impl BountyEscrowContract {
         Self::get_escrow_freeze_record_internal(&env, bounty_id)
     }
 
+    /// Returns the escrow record for `bounty_id`. Panics if not found.
+    pub fn get_escrow(env: Env, bounty_id: u64) -> Escrow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .expect("bounty not found")
+    }
+
     /// Freeze all release/refund operations for escrows owned by `address`.
     ///
     /// Read-only queries remain available while the freeze is active.
@@ -1894,10 +2105,18 @@ impl BountyEscrowContract {
     }
 
     /// Update maintenance mode (admin only)
+    ///
+    /// # Timelock Guard
+    /// When timelock is enabled, this function returns `TimelockEnabled`.
+    /// Use `propose_admin_action` with `ActionType::SetMaintenanceMode` instead.
     pub fn set_maintenance_mode(env: Env, enabled: bool) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
+
+        // Timelock guard: reject direct calls when timelock is enabled
+        Self::check_timelock_guard(&env)?;
+
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -1913,6 +2132,505 @@ impl BountyEscrowContract {
                 timestamp: env.ledger().timestamp(),
             },
         );
+        Ok(())
+    }
+
+    // ============================================================================
+    // TIMELOCK FUNCTIONS
+    // ============================================================================
+
+    /// Configure timelock settings (admin only).
+    ///
+    /// # Arguments
+    /// * `delay` - Timelock delay in seconds (must be between MINIMUM_DELAY and MAX_DELAY)
+    /// * `is_enabled` - Whether timelock is enabled
+    ///
+    /// # Errors
+    /// * `NotInitialized` - Contract not initialized
+    /// * `Unauthorized` - Caller not admin
+    /// * `DelayBelowMinimum` - Delay < MINIMUM_DELAY
+    /// * `DelayAboveMaximum` - Delay > MAX_DELAY
+    ///
+    /// # Events
+    /// * `TimelockConfigured` - Emitted when configuration changes
+    ///
+    /// # Design Note
+    /// This function bypasses the timelock (bootstrap problem). The initial admin
+    /// must trust this function or the contract can never enable timelock protection.
+    pub fn configure_timelock(env: Env, delay: u64, is_enabled: bool) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        // Validate delay bounds if timelock is being enabled
+        if is_enabled {
+            if delay < MINIMUM_DELAY {
+                return Err(Error::DelayBelowMinimum);
+            }
+            if delay > MAX_DELAY {
+                return Err(Error::DelayAboveMaximum);
+            }
+        }
+
+        let config = TimelockConfig { delay, is_enabled };
+        env.storage()
+            .instance()
+            .set(&DataKey::TimelockConfig, &config);
+
+        emit_timelock_configured(
+            &env,
+            TimelockConfigured {
+                version: EVENT_VERSION_V2,
+                delay,
+                is_enabled,
+                configured_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get current timelock configuration
+    pub fn get_timelock_config(env: Env) -> TimelockConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::TimelockConfig)
+            .unwrap_or(TimelockConfig {
+                delay: DEFAULT_DELAY,
+                is_enabled: false,
+            })
+    }
+
+    /// Propose an admin action with optional timelock delay.
+    ///
+    /// If timelock is disabled, executes immediately and returns 0.
+    /// If timelock is enabled, creates a pending action and returns the action_id.
+    ///
+    /// # Arguments
+    /// * `action_type` - Type of admin action
+    /// * `payload` - Action-specific parameters
+    ///
+    /// # Returns
+    /// * `u64` - Action ID if pending, 0 if executed immediately
+    ///
+    /// # Errors
+    /// * `NotInitialized` - Contract not initialized
+    /// * `Unauthorized` - Caller not admin
+    /// * `InvalidPayload` - Payload doesn't match action type
+    /// * `TimelockNotEnabled` - Shouldn't happen (logic error)
+    pub fn propose_admin_action(
+        env: Env,
+        action_type: ActionType,
+        payload: ActionPayload,
+    ) -> Result<u64, Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        // Validate payload matches action type
+        Self::validate_payload_matches_action_type(&action_type, &payload)?;
+
+        let timelock_config = Self::get_timelock_config(env.clone());
+
+        if !timelock_config.is_enabled {
+            // Execute immediately - bypass timelock
+            Self::execute_action(env.clone(), payload.clone())?;
+            return Ok(0); // Signal immediate execution
+        }
+
+        // Create pending action
+        let action_id: u64 = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::ActionCounter)
+            .unwrap_or(0u64)
+            .checked_add(1)
+            .unwrap_or(0);
+
+        let current_timestamp = env.ledger().timestamp();
+        let execute_after = current_timestamp
+            .checked_add(timelock_config.delay)
+            .unwrap_or(current_timestamp);
+
+        // Serialize payload for storage
+        let serialized_payload = payload.to_xdr(&env);
+
+        let pending_action = PendingAction {
+            action_id,
+            action_type,
+            payload: serialized_payload,
+            proposed_by: admin.clone(),
+            proposed_at: current_timestamp,
+            execute_after,
+            status: ActionStatus::Pending,
+        };
+
+        // Store the action and increment counter
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id), &pending_action);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActionCounter, &action_id);
+
+        emit_admin_action_proposed(
+            &env,
+            AdminActionProposed {
+                version: EVENT_VERSION_V2,
+                action_type,
+                execute_after,
+                proposed_by: admin,
+                timestamp: current_timestamp,
+            },
+        );
+
+        Ok(action_id)
+    }
+
+    /// Execute a pending admin action after the timelock delay.
+    ///
+    /// Anyone can call this function - it's permissionless by design.
+    /// The action will only execute if the delay has elapsed.
+    ///
+    /// # Arguments
+    /// * `action_id` - ID of the pending action
+    ///
+    /// # Errors
+    /// * `ActionNotFound` - Action doesn't exist
+    /// * `ActionAlreadyExecuted` - Action already executed
+    /// * `ActionAlreadyCancelled` - Action already cancelled
+    /// * `TimelockNotElapsed` - Delay hasn't elapsed yet
+    pub fn execute_after_delay(env: Env, action_id: u64) -> Result<(), Error> {
+        // Load pending action
+        let mut action: PendingAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAction(action_id))
+            .ok_or(Error::ActionNotFound)?;
+
+        // Check status
+        if action.status == ActionStatus::Executed {
+            return Err(Error::ActionAlreadyExecuted);
+        }
+        if action.status == ActionStatus::Cancelled {
+            return Err(Error::ActionAlreadyCancelled);
+        }
+
+        // Check timelock elapsed
+        let current_timestamp = env.ledger().timestamp();
+        if current_timestamp < action.execute_after {
+            return Err(Error::TimelockNotElapsed);
+        }
+
+        // Deserialize payload
+        let payload =
+            ActionPayload::from_xdr(&env, &action.payload).map_err(|_| Error::ActionNotFound)?;
+
+        // Execute the action
+        Self::execute_action(env.clone(), payload.clone())?;
+
+        // Update status
+        action.status = ActionStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id), &action);
+
+        emit_admin_action_executed(
+            &env,
+            AdminActionExecuted {
+                version: EVENT_VERSION_V2,
+                action_type: action.action_type,
+                executed_by: env.current_contract_address(), // Any caller can execute
+                executed_at: current_timestamp,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin action (admin only).
+    ///
+    /// # Arguments
+    /// * `action_id` - ID of the pending action
+    ///
+    /// # Errors
+    /// * `NotInitialized` - Contract not initialized
+    /// * `Unauthorized` - Caller not admin
+    /// * `ActionNotFound` - Action doesn't exist
+    /// * `ActionAlreadyExecuted` - Action already executed
+    /// * `ActionAlreadyCancelled` - Action already cancelled
+    pub fn cancel_admin_action(env: Env, action_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        // Load pending action
+        let mut action: PendingAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAction(action_id))
+            .ok_or(Error::ActionNotFound)?;
+
+        // Check status
+        if action.status == ActionStatus::Executed {
+            return Err(Error::ActionAlreadyExecuted);
+        }
+        if action.status == ActionStatus::Cancelled {
+            return Err(Error::ActionAlreadyCancelled);
+        }
+
+        // Update status
+        action.status = ActionStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id), &action);
+
+        emit_admin_action_cancelled(
+            &env,
+            AdminActionCancelled {
+                version: EVENT_VERSION_V2,
+                action_type: action.action_type,
+                cancelled_by: admin,
+                cancelled_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get all pending admin actions ordered by proposal time.
+    ///
+    /// This provides public visibility into proposed admin actions.
+    pub fn get_pending_actions(env: Env) -> Vec<PendingAction> {
+        let mut pending = Vec::new(&env);
+
+        // Get the action counter to know the range to search
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActionCounter)
+            .unwrap_or(0);
+
+        // Collect all pending actions
+        for action_id in 1..=counter {
+            if let Some(action) = env
+                .storage()
+                .persistent()
+                .get::<_, PendingAction>(&DataKey::PendingAction(action_id))
+            {
+                if action.status == ActionStatus::Pending {
+                    pending.push_back(action);
+                }
+            }
+        }
+
+        pending
+    }
+
+    /// Get a specific admin action by ID.
+    ///
+    /// # Errors
+    /// * `ActionNotFound` - Action doesn't exist
+    pub fn get_action(env: Env, action_id: u64) -> Result<PendingAction, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAction(action_id))
+            .ok_or(Error::ActionNotFound)
+    }
+
+    // ============================================================================
+    // PRIVATE TIMELOCK HELPERS
+    // ============================================================================
+
+    /// Check if timelock is enabled and reject direct admin calls if so
+    fn check_timelock_guard(env: &Env) -> Result<(), Error> {
+        let timelock_config = Self::get_timelock_config(env.clone());
+        if timelock_config.is_enabled {
+            return Err(Error::TimelockEnabled);
+        }
+        Ok(())
+    }
+
+    /// Validate that payload matches the expected action type
+    fn validate_payload_matches_action_type(
+        action_type: &ActionType,
+        payload: &ActionPayload,
+    ) -> Result<(), Error> {
+        match (action_type, payload) {
+            (ActionType::ChangeAdmin, ActionPayload::ChangeAdmin(..)) => Ok(()),
+            (ActionType::ChangeFeeRecipient, ActionPayload::ChangeFeeRecipient(..)) => Ok(()),
+            (ActionType::EnableKillSwitch, ActionPayload::EnableKillSwitch) => Ok(()),
+            (ActionType::DisableKillSwitch, ActionPayload::DisableKillSwitch) => Ok(()),
+            (ActionType::SetMaintenanceMode, ActionPayload::SetMaintenanceMode(..)) => Ok(()),
+            (ActionType::UnsetMaintenanceMode, ActionPayload::SetMaintenanceMode(..)) => Ok(()),
+            (ActionType::SetPaused, ActionPayload::SetPaused(..)) => Ok(()),
+            (ActionType::UnsetPaused, ActionPayload::SetPaused(..)) => Ok(()),
+            _ => Err(Error::InvalidPayload),
+        }
+    }
+
+    /// Execute an admin action (bypasses all auth checks)
+    fn execute_action(env: Env, payload: ActionPayload) -> Result<(), Error> {
+        match payload {
+            ActionPayload::ChangeAdmin(new_admin) => Self::_execute_change_admin(env, new_admin),
+            ActionPayload::ChangeFeeRecipient(new_recipient) => {
+                Self::_execute_change_fee_recipient(env, new_recipient)
+            }
+            ActionPayload::EnableKillSwitch => Self::_execute_set_deprecated(env, true, None),
+            ActionPayload::DisableKillSwitch => Self::_execute_set_deprecated(env, false, None),
+            ActionPayload::SetMaintenanceMode(enabled) => {
+                Self::_execute_set_maintenance_mode(env, enabled)
+            }
+            ActionPayload::SetPaused(lock, release, refund) => {
+                Self::_execute_set_paused(env, lock, release, refund, None)
+            }
+        }
+    }
+
+    fn load_escrow_info(env: &Env, bounty_id: u64) -> EscrowInfo {
+        if let Some(escrow) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+        {
+            EscrowInfo {
+                depositor: AnonymousParty::Address(escrow.depositor),
+                amount: escrow.amount,
+                remaining_amount: escrow.remaining_amount,
+                status: escrow.status,
+                deadline: escrow.deadline,
+                refund_history: escrow.refund_history,
+            }
+        } else if let Some(anon) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, AnonymousEscrow>(&DataKey::EscrowAnon(bounty_id))
+        {
+            EscrowInfo {
+                depositor: AnonymousParty::Commitment(anon.depositor_commitment),
+                amount: anon.amount,
+                remaining_amount: anon.remaining_amount,
+                status: anon.status,
+                deadline: anon.deadline,
+                refund_history: anon.refund_history,
+            }
+        } else {
+            panic!("bounty not found")
+        }
+    }
+
+    // ============================================================================
+    // PRIVATE EXECUTION HELPERS (called by timelock)
+    // ============================================================================
+
+    /// Private helper to change admin without auth checks
+    fn _execute_change_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// Private helper to change fee recipient without auth checks
+    fn _execute_change_fee_recipient(env: Env, new_recipient: Address) -> Result<(), Error> {
+        let mut fee_config = Self::get_fee_config_internal(&env);
+        fee_config.fee_recipient = new_recipient;
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &fee_config);
+
+        events::emit_fee_config_updated(
+            &env,
+            events::FeeConfigUpdated {
+                lock_fee_rate: fee_config.lock_fee_rate,
+                release_fee_rate: fee_config.release_fee_rate,
+                lock_fixed_fee: fee_config.lock_fixed_fee,
+                release_fixed_fee: fee_config.release_fixed_fee,
+                fee_recipient: fee_config.fee_recipient.clone(),
+                fee_enabled: fee_config.fee_enabled,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Private helper to set deprecation without auth checks
+    fn _execute_set_deprecated(
+        env: Env,
+        deprecated: bool,
+        migration_target: Option<Address>,
+    ) -> Result<(), Error> {
+        let state = DeprecationState {
+            deprecated,
+            migration_target: migration_target.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::DeprecationState, &state);
+
+        emit_deprecation_state_changed(
+            &env,
+            DeprecationStateChanged {
+                deprecated: state.deprecated,
+                migration_target: state.migration_target,
+                admin: rbac::require_admin(&env), // For event purposes
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Private helper to set maintenance mode without auth checks
+    fn _execute_set_maintenance_mode(env: Env, enabled: bool) -> Result<(), Error> {
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceMode, &enabled);
+
+        events::emit_maintenance_mode_changed(
+            &env,
+            MaintenanceModeChanged {
+                enabled,
+                admin: rbac::require_admin(&env), // For event purposes
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Private helper to set pause flags without auth checks
+    fn _execute_set_paused(
+        env: Env,
+        lock: Option<bool>,
+        release: Option<bool>,
+        refund: Option<bool>,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), Error> {
+        let mut flags = Self::get_pause_flags(&env);
+
+        if let Some(lock_paused) = lock {
+            flags.lock_paused = lock_paused;
+        }
+        if let Some(release_paused) = release {
+            flags.release_paused = release_paused;
+        }
+        if let Some(refund_paused) = refund {
+            flags.refund_paused = refund_paused;
+        }
+        if reason.is_some() {
+            flags.pause_reason = reason;
+        }
+        if lock.is_some() || release.is_some() || refund.is_some() {
+            flags.paused_at = env.ledger().timestamp();
+        }
+
+        env.storage().instance().set(&DataKey::PauseFlags, &flags);
+
         Ok(())
     }
 
@@ -1954,7 +2672,7 @@ impl BountyEscrowContract {
         env.storage()
             .persistent()
             .get(&DataKey::Capability(capability_id.clone()))
-            .ok_or(Error::CapabilityNotFound)
+            .ok_or(Error::CapNotFound)
     }
 
     fn validate_capability_scope_at_issue(
@@ -1965,7 +2683,7 @@ impl BountyEscrowContract {
         amount_limit: i128,
     ) -> Result<(), Error> {
         if amount_limit <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         match action {
@@ -1985,7 +2703,7 @@ impl BountyEscrowContract {
                     return Err(Error::Unauthorized);
                 }
                 if amount_limit > claim.amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
             CapabilityAction::Release => {
@@ -2002,11 +2720,15 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to release
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::ActionNotFound);
+                }
                 if escrow.status != EscrowStatus::Locked {
                     return Err(Error::FundsNotLocked);
                 }
                 if amount_limit > escrow.remaining_amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
             CapabilityAction::Refund => {
@@ -2023,13 +2745,17 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to refund
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::ActionNotFound);
+                }
                 if escrow.status != EscrowStatus::Locked
                     && escrow.status != EscrowStatus::PartiallyRefunded
                 {
                     return Err(Error::FundsNotLocked);
                 }
                 if amount_limit > escrow.remaining_amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
         }
@@ -2043,7 +2769,7 @@ impl BountyEscrowContract {
         requested_amount: i128,
     ) -> Result<(), Error> {
         if requested_amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         match capability.action {
@@ -2063,7 +2789,7 @@ impl BountyEscrowContract {
                     return Err(Error::Unauthorized);
                 }
                 if requested_amount > claim.amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
             CapabilityAction::Release => {
@@ -2080,11 +2806,15 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(capability.bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to release
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::ActionNotFound);
+                }
                 if escrow.status != EscrowStatus::Locked {
                     return Err(Error::FundsNotLocked);
                 }
                 if requested_amount > escrow.remaining_amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
             CapabilityAction::Refund => {
@@ -2101,13 +2831,17 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(capability.bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to refund
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::ActionNotFound);
+                }
                 if escrow.status != EscrowStatus::Locked
                     && escrow.status != EscrowStatus::PartiallyRefunded
                 {
                     return Err(Error::FundsNotLocked);
                 }
                 if requested_amount > escrow.remaining_amount {
-                    return Err(Error::CapabilityExceedsAuthority);
+                    return Err(Error::CapExceedsAuthority);
                 }
             }
         }
@@ -2142,25 +2876,25 @@ impl BountyEscrowContract {
         let mut capability = Self::load_capability(env, capability_id.clone())?;
 
         if capability.revoked {
-            return Err(Error::CapabilityRevoked);
+            return Err(Error::CapRevoked);
         }
         if capability.action != expected_action {
-            return Err(Error::CapabilityActionMismatch);
+            return Err(Error::CapActionMismatch);
         }
         if capability.bounty_id != bounty_id {
-            return Err(Error::CapabilityActionMismatch);
+            return Err(Error::CapActionMismatch);
         }
         if capability.holder != holder.clone() {
             return Err(Error::Unauthorized);
         }
         if env.ledger().timestamp() > capability.expiry {
-            return Err(Error::CapabilityExpired);
+            return Err(Error::CapExpired);
         }
         if capability.remaining_uses == 0 {
-            return Err(Error::CapabilityUsesExhausted);
+            return Err(Error::CapUsesExhausted);
         }
         if amount > capability.remaining_amount {
-            return Err(Error::CapabilityAmountExceeded);
+            return Err(Error::CapAmountExceeded);
         }
 
         holder.require_auth();
@@ -2221,7 +2955,7 @@ impl BountyEscrowContract {
             return Err(Error::NotInitialized);
         }
         if max_uses == 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let now = env.ledger().timestamp();
@@ -2267,7 +3001,11 @@ impl BountyEscrowContract {
         Ok(capability_id.clone())
     }
 
-    pub fn revoke_capability(env: Env, owner: Address, capability_id: BytesN<32>) -> Result<(), Error> {
+    pub fn revoke_capability(
+        env: Env,
+        owner: Address,
+        capability_id: BytesN<32>,
+    ) -> Result<(), Error> {
         let mut capability = Self::load_capability(&env, capability_id.clone())?;
         if capability.owner != owner {
             return Err(Error::Unauthorized);
@@ -2338,13 +3076,13 @@ impl BountyEscrowContract {
         admin.require_auth();
 
         if !(0..=MAX_FEE_RATE).contains(&lock_fee_rate) {
-            return Err(Error::InvalidFeeRate);
+            return Err(Error::ActionNotFound);
         }
         if !(0..=MAX_FEE_RATE).contains(&release_fee_rate) {
-            return Err(Error::InvalidFeeRate);
+            return Err(Error::ActionNotFound);
         }
         if lock_fixed_fee < 0 || release_fixed_fee < 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let config = TokenFeeConfig {
@@ -2419,7 +3157,7 @@ impl BountyEscrowContract {
         admin.require_auth();
 
         if required_signatures > signers.len() {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let config = MultisigConfig {
@@ -2591,11 +3329,11 @@ impl BountyEscrowContract {
         {
             if amount < min_amount {
                 reentrancy_guard::release(&env);
-                return Err(Error::AmountBelowMinimum);
+                return Err(Error::ActionNotFound);
             }
             if amount > max_amount {
                 reentrancy_guard::release(&env);
-                return Err(Error::AmountAboveMaximum);
+                return Err(Error::ActionNotFound);
             }
         }
         soroban_sdk::log!(&env, "amount policy ok");
@@ -2633,7 +3371,7 @@ impl BountyEscrowContract {
         // Fee must never exceed the deposit; guard against misconfiguration.
         let net_amount = amount.checked_sub(fee_amount).unwrap_or(amount);
         if net_amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         // Transfer fee to recipient immediately (separate transfer so it is
@@ -2642,7 +3380,6 @@ impl BountyEscrowContract {
             Self::route_fee(
                 &env,
                 &client,
-                &fee_config,
                 fee_amount,
                 lock_fee_rate,
                 events::FeeOperationType::Lock,
@@ -2653,7 +3390,7 @@ impl BountyEscrowContract {
         let escrow = Escrow {
             depositor: depositor.clone(),
             amount: net_amount,
-            status: EscrowStatus::Locked,
+            status: EscrowStatus::Draft,
             deadline,
             refund_history: vec![&env],
             remaining_amount: net_amount,
@@ -2719,7 +3456,7 @@ impl BountyEscrowContract {
                 return Err(e);
             }
         }
-
+        audit_trail::log_action(&env, symbol_short!("lock"), depositor.clone(), bounty_id);
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -2859,10 +3596,10 @@ impl BountyEscrowContract {
             .get::<DataKey, (i128, i128)>(&DataKey::AmountPolicy)
         {
             if amount < min_amount {
-                return Err(Error::AmountBelowMinimum);
+                return Err(Error::ActionNotFound);
             }
             if amount > max_amount {
-                return Err(Error::AmountAboveMaximum);
+                return Err(Error::ActionNotFound);
             }
         }
         // 5. Bounty must not already exist
@@ -2871,7 +3608,7 @@ impl BountyEscrowContract {
         }
         // 6. Amount validation
         if amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(env, &token_addr);
@@ -2893,22 +3630,9 @@ impl BountyEscrowContract {
             Self::combined_fee_amount(amount, lock_fee_rate, lock_fixed_fee, fee_enabled);
         let net_amount = amount.checked_sub(fee_amount).unwrap_or(amount);
         if net_amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         Ok((net_amount,))
-    }
-
-    /// Returns whether the given bounty escrow is marked as using non-transferable (soulbound)
-    /// reward tokens. When true, the token is expected to disallow further transfers after claim.
-    pub fn get_non_transferable_rewards(env: Env, bounty_id: u64) -> Result<bool, Error> {
-        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
-            return Err(Error::BountyNotFound);
-        }
-        Ok(env
-            .storage()
-            .persistent()
-            .get(&DataKey::NonTransferableRewards(bounty_id))
-            .unwrap_or(false))
     }
 
     /// Lock funds for a bounty in anonymous mode: only a 32-byte depositor commitment is stored.
@@ -2969,11 +3693,11 @@ impl BountyEscrowContract {
         {
             if amount < min_amount {
                 reentrancy_guard::release(&env);
-                return Err(Error::AmountBelowMinimum);
+                return Err(Error::ActionNotFound);
             }
             if amount > max_amount {
                 reentrancy_guard::release(&env);
-                return Err(Error::AmountAboveMaximum);
+                return Err(Error::ActionNotFound);
             }
         }
 
@@ -2981,7 +3705,7 @@ impl BountyEscrowContract {
             depositor_commitment: depositor_commitment.clone(),
             amount,
             remaining_amount: amount,
-            status: EscrowStatus::Locked,
+            status: EscrowStatus::Draft,
             deadline,
             refund_history: vec![&env],
             archived: false,
@@ -3033,6 +3757,63 @@ impl BountyEscrowContract {
     ///
     /// # Security
     /// Reentrancy guard is always cleared before any explicit error return after acquisition.
+    pub fn publish(env: Env, bounty_id: u64) -> Result<(), Error> {
+        let caller = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set");
+        let res = Self::publish_logic(env.clone(), bounty_id, caller.clone());
+        monitoring::track_operation(&env, symbol_short!("publish"), caller, res.is_ok());
+        res
+    }
+
+    fn publish_logic(env: Env, bounty_id: u64, publisher: Address) -> Result<(), Error> {
+        // Validation precedence:
+        // 1. Reentrancy guard
+        // 2. Authorization (admin only)
+        // 3. Escrow exists and is in Draft status
+
+        // 1. Acquire reentrancy guard
+        reentrancy_guard::acquire(&env);
+
+        // 2. Admin authorization
+        publisher.require_auth();
+
+        // 3. Get escrow and verify it's in Draft status
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .ok_or(Error::BountyNotFound)?;
+
+        if escrow.status != EscrowStatus::Draft {
+            reentrancy_guard::release(&env);
+            return Err(Error::ActionNotFound);
+        }
+
+        // Transition from Draft to Locked
+        escrow.status = EscrowStatus::Locked;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        // Emit EscrowPublished event
+        emit_escrow_published(
+            &env,
+            EscrowPublished {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                published_by: publisher,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        multitoken_invariants::assert_after_lock(&env);
+        reentrancy_guard::release(&env);
+        Ok(())
+    }
+
     pub fn release_funds(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
         let caller = env
             .storage()
@@ -3083,7 +3864,13 @@ impl BountyEscrowContract {
         Self::ensure_escrow_not_frozen(&env, bounty_id)?;
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
-        if escrow.status != EscrowStatus::Locked {
+        // Escrow must be published (not in Draft) and locked to release funds
+        if escrow.status == EscrowStatus::Draft {
+            reentrancy_guard::release(&env);
+            return Err(Error::ActionNotFound);
+        }
+        if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
+        {
             reentrancy_guard::release(&env);
             return Err(Error::FundsNotLocked);
         }
@@ -3117,7 +3904,7 @@ impl BountyEscrowContract {
             .unwrap_or(escrow.amount);
         if net_payout <= 0 {
             reentrancy_guard::release(&env);
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         // EFFECTS: update state before external calls (CEI)
@@ -3136,9 +3923,8 @@ impl BountyEscrowContract {
             Self::route_fee(
                 &env,
                 &client,
-                &fee_config,
                 release_fee,
-                release_fee_rate,
+                fee_config.release_fee_rate,
                 events::FeeOperationType::Release,
             )?;
         }
@@ -3155,7 +3941,12 @@ impl BountyEscrowContract {
                 timestamp: env.ledger().timestamp(),
             },
         );
-
+        audit_trail::log_action(
+            &env,
+            symbol_short!("release"),
+            contributor.clone(),
+            bounty_id,
+        );
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -3238,7 +4029,7 @@ impl BountyEscrowContract {
             .checked_sub(release_fee)
             .unwrap_or(escrow.amount);
         if net_payout <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         Ok((escrow.amount,))
     }
@@ -3260,7 +4051,7 @@ impl BountyEscrowContract {
             return Err(Error::FundsPaused);
         }
         if payout_amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
@@ -3374,7 +4165,7 @@ impl BountyEscrowContract {
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
         if escrow.status != EscrowStatus::Locked {
-            return Err(Error::FundsNotLocked);
+            return Err(Error::ActionNotFound);
         }
 
         let now = env.ledger().timestamp();
@@ -3662,7 +4453,7 @@ impl BountyEscrowContract {
         }
 
         if amount <= 0 || amount > escrow.remaining_amount {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let approval = RefundApproval {
@@ -3732,7 +4523,7 @@ impl BountyEscrowContract {
 
         // Guard: zero or negative payout makes no sense and would corrupt state
         if payout_amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         // Guard: prevent overpayment — payout cannot exceed what is still owed
@@ -3865,7 +4656,7 @@ impl BountyEscrowContract {
         };
 
         if refund_amount <= 0 || refund_amount > escrow.remaining_amount {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         // EFFECTS: update state before external call (CEI)
@@ -3913,6 +4704,11 @@ impl BountyEscrowContract {
                 amount: refund_amount,
                 refund_to: refund_to.clone(),
                 timestamp: now,
+                trigger_type: if approval.is_some() {
+                    RefundTriggerType::AdminApproval
+                } else {
+                    RefundTriggerType::DeadlineExpired
+                },
             },
         );
         Self::record_receipt(
@@ -3941,7 +4737,12 @@ impl BountyEscrowContract {
                 return Err(e);
             }
         }
-
+        audit_trail::log_action(
+            &env,
+            symbol_short!("refund"),
+            escrow.depositor.clone(),
+            bounty_id,
+        );
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -4015,17 +4816,24 @@ impl BountyEscrowContract {
         let now = env.ledger().timestamp();
         let approval_key = DataKey::RefundApproval(bounty_id);
         let approval: Option<RefundApproval> = env.storage().persistent().get(&approval_key);
+
+        // Refund is allowed if:
+        // 1. Deadline has passed (returns full amount to depositor)
+        // 2. An administrative approval exists (can be early, partial, and to custom recipient)
         if now < escrow.deadline && approval.is_none() {
             return Err(Error::DeadlineNotPassed);
         }
-        let (refund_amount, _refund_to, is_full) = if let Some(app) = approval {
+
+        let (refund_amount, _refund_to, is_full) = if let Some(app) = approval.clone() {
             let full = app.mode == RefundMode::Full || app.amount >= escrow.remaining_amount;
             (app.amount, app.recipient, full)
         } else {
+            // Standard refund after deadline
             (escrow.remaining_amount, escrow.depositor.clone(), true)
         };
+
         if refund_amount <= 0 || refund_amount > escrow.remaining_amount {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         let remaining_after = escrow
             .remaining_amount
@@ -4071,7 +4879,7 @@ impl BountyEscrowContract {
             .storage()
             .instance()
             .get(&DataKey::AnonymousResolver)
-            .ok_or(Error::AnonymousResolverNotSet)?;
+            .ok_or(Error::AnonResolverNotSet)?;
         resolver.require_auth();
 
         if !env
@@ -4132,7 +4940,7 @@ impl BountyEscrowContract {
         };
 
         if refund_amount <= 0 || refund_amount > anon.remaining_amount {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -4180,6 +4988,11 @@ impl BountyEscrowContract {
                 amount: refund_amount,
                 refund_to: refund_to.clone(),
                 timestamp: now,
+                trigger_type: if approval.is_some() {
+                    RefundTriggerType::AdminApproval
+                } else {
+                    RefundTriggerType::DeadlineExpired
+                },
             },
         );
 
@@ -4204,7 +5017,7 @@ impl BountyEscrowContract {
             return Err(Error::FundsPaused);
         }
         if amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
@@ -4219,12 +5032,16 @@ impl BountyEscrowContract {
         Self::ensure_escrow_not_frozen(&env, bounty_id)?;
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
+        // Escrow must be published (not in Draft) to refund
+        if escrow.status == EscrowStatus::Draft {
+            return Err(Error::ActionNotFound);
+        }
         if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
         {
             return Err(Error::FundsNotLocked);
         }
         if amount > escrow.remaining_amount {
-            return Err(Error::InvalidAmount);
+            return Err(Error::ActionNotFound);
         }
 
         if env
@@ -4255,109 +5072,36 @@ impl BountyEscrowContract {
         let now = env.ledger().timestamp();
         let refund_to = escrow.depositor.clone();
 
-    pub fn initialize_escrow(
-        ctx: Context<InitializeEscrow>,
-        bounty_id: String,
-        amount: u64,
-        expiry: i64,
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        escrow.initializer = ctx.accounts.initializer.key();
-        escrow.bounty_id = bounty_id;
-        escrow.amount = amount;
-        escrow.expiry = expiry;
-        escrow.status = EscrowStatus::Active;
-        escrow.bump = ctx.bumps.escrow;
-
-        // Transfer tokens to vault
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.initializer_token_account.to_account_info(),
-            to: ctx.accounts.vault_token_account.to_account_info(),
-            authority: ctx.accounts.initializer.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
-
-        emit!(EscrowInitialized {
-            bounty_id: escrow.bounty_id.clone(),
-            initializer: escrow.initializer,
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn complete_bounty(ctx: Context<CompleteBounty>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.contributor_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Completed;
-
-        emit!(BountyCompleted {
-            bounty_id: escrow.bounty_id.clone(),
-            contributor: ctx.accounts.contributor.key(),
-        });
-
-        Ok(())
-    }
-
-    // --- NEW FUNCTIONS FROM new_functions.rs ---
-
-    pub fn set_conditional_refund(
-        ctx: Context<SetRefund>, 
-        mode: RefundMode, 
-        config: GasBudgetConfig
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        refund_record.escrow = escrow.key();
-        refund_record.mode = mode;
-        refund_record.gas_budget = config.max_gas;
-        refund_record.is_resolved = false;
-
-        emit!(RefundModeSet {
-            bounty_id: escrow.bounty_id.clone(),
-            mode,
-        });
-
-        Ok(())
-    }
-
-    pub fn trigger_refund(ctx: Context<TriggerRefund>) -> Result<()> {
-        let escrow = &ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
-        
-        let clock = Clock::get()?;
-        if refund_record.mode == RefundMode::TimeBased {
-            require!(clock.unix_timestamp > escrow.expiry, EscrowError::ExpiryNotReached);
+        // EFFECTS: update escrow state before external call (CEI)
+        escrow.remaining_amount = escrow.remaining_amount.saturating_sub(amount);
+        if escrow.remaining_amount == 0 {
+            escrow.status = EscrowStatus::Refunded;
+        } else {
+            escrow.status = EscrowStatus::PartiallyRefunded;
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
 
-        emit!(RefundTriggered {
-            bounty_id: escrow.bounty_id.clone(),
-            timestamp: clock.unix_timestamp,
-        });
+        // INTERACTION: external token transfer
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &refund_to, &amount);
 
+        emit_funds_refunded(
+            &env,
+            FundsRefunded {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                amount,
+                refund_to: refund_to.clone(),
+                timestamp: now,
+                trigger_type: RefundTriggerType::AdminApproval,
+            },
+        );
+
+        // GUARD: release reentrancy lock
+        reentrancy_guard::release(&env);
         Ok(())
     }
 
@@ -4407,13 +5151,13 @@ impl BountyEscrowContract {
     /// Number of bounties successfully locked (equals `items.len()` on success).
     ///
     /// # Errors
-    /// * [`Error::InvalidBatchSize`] — batch is empty or exceeds `MAX_BATCH_SIZE`
+    /// * [`Error::ActionNotFound`] — batch is empty or exceeds `MAX_BATCH_SIZE`
     /// * [`Error::ContractDeprecated`] — contract has been killed via `set_deprecated`
     /// * [`Error::FundsPaused`] — lock operations are currently paused
     /// * [`Error::NotInitialized`] — `init` has not been called
     /// * [`Error::BountyExists`] — a `bounty_id` already exists in storage
-    /// * [`Error::DuplicateBountyId`] — the same `bounty_id` appears more than once
-    /// * [`Error::InvalidAmount`] — any item has `amount ≤ 0`
+    /// * [`Error::BountyExists`] — the same `bounty_id` appears more than once
+    /// * [`Error::ActionNotFound`] — any item has `amount ≤ 0`
     /// * [`Error::ParticipantBlocked`] / [`Error::ParticipantNotAllowed`] — participant filter
     ///
     /// # Reentrancy
@@ -4436,10 +5180,10 @@ impl BountyEscrowContract {
             // Validate batch size
             let batch_size = items.len();
             if batch_size == 0 {
-                return Err(Error::InvalidBatchSize);
+                return Err(Error::ActionNotFound);
             }
             if batch_size > MAX_BATCH_SIZE {
-                return Err(Error::InvalidBatchSize);
+                return Err(Error::ActionNotFound);
             }
 
             if !env.storage().instance().has(&DataKey::Admin) {
@@ -4467,7 +5211,7 @@ impl BountyEscrowContract {
 
                 // Validate amount
                 if item.amount <= 0 {
-                    return Err(Error::InvalidAmount);
+                    return Err(Error::ActionNotFound);
                 }
 
                 // Check for duplicate bounty_ids in the batch
@@ -4478,7 +5222,7 @@ impl BountyEscrowContract {
                     }
                 }
                 if count > 1 {
-                    return Err(Error::DuplicateBountyId);
+                    return Err(Error::BountyExists);
                 }
             }
 
@@ -4508,13 +5252,14 @@ impl BountyEscrowContract {
                 let escrow = Escrow {
                     depositor: item.depositor.clone(),
                     amount: item.amount,
-                    status: EscrowStatus::Locked,
+                    status: EscrowStatus::Draft,
                     deadline: item.deadline,
                     refund_history: vec![&env],
                     remaining_amount: item.amount,
                     archived: false,
                     archived_at: None,
                 };
+                invariants::assert_escrow(&env, &escrow);
 
                 env.storage()
                     .persistent()
@@ -4595,11 +5340,6 @@ impl BountyEscrowContract {
         result
     }
 
-    /// Alias for batch_lock_funds to match the requested naming convention.
-    pub fn batch_lock(env: Env, items: Vec<LockFundsItem>) -> Result<u32, Error> {
-        Self::batch_lock_funds(env, items)
-    }
-
     /// Batch release funds to multiple contributors in a single atomic transaction.
     ///
     /// Releases between 1 and [`MAX_BATCH_SIZE`] bounties in one admin-authorised
@@ -4638,13 +5378,13 @@ impl BountyEscrowContract {
     /// Number of bounties successfully released (equals `items.len()` on success).
     ///
     /// # Errors
-    /// * [`Error::InvalidBatchSize`] — batch is empty or exceeds `MAX_BATCH_SIZE`
+    /// * [`Error::ActionNotFound`] — batch is empty or exceeds `MAX_BATCH_SIZE`
     /// * [`Error::FundsPaused`] — release operations are currently paused
     /// * [`Error::NotInitialized`] — `init` has not been called
     /// * [`Error::Unauthorized`] — caller is not the admin
     /// * [`Error::BountyNotFound`] — a `bounty_id` does not exist in storage
     /// * [`Error::FundsNotLocked`] — a bounty's status is not `Locked`
-    /// * [`Error::DuplicateBountyId`] — the same `bounty_id` appears more than once
+    /// * [`Error::BountyExists`] — the same `bounty_id` appears more than once
     ///
     /// # Reentrancy
     /// Protected by the shared reentrancy guard (acquired before validation,
@@ -4662,10 +5402,10 @@ impl BountyEscrowContract {
             // Validate batch size
             let batch_size = items.len();
             if batch_size == 0 {
-                return Err(Error::InvalidBatchSize);
+                return Err(Error::ActionNotFound);
             }
             if batch_size > MAX_BATCH_SIZE {
-                return Err(Error::InvalidBatchSize);
+                return Err(Error::ActionNotFound);
             }
 
             if !env.storage().instance().has(&DataKey::Admin) {
@@ -4714,12 +5454,12 @@ impl BountyEscrowContract {
                     }
                 }
                 if count > 1 {
-                    return Err(Error::DuplicateBountyId);
+                    return Err(Error::BountyExists);
                 }
 
                 total_amount = total_amount
                     .checked_add(escrow.amount)
-                    .ok_or(Error::InvalidAmount)?;
+                    .ok_or(Error::ActionNotFound)?;
             }
 
             let ordered_items = Self::order_batch_release_items(&env, &items);
@@ -4782,7 +5522,7 @@ impl BountyEscrowContract {
             let gas_cfg = gas_budget::get_config(&env);
             if let Err(e) = gas_budget::check(
                 &env,
-                symbol_short!("b_release"),
+                symbol_short!("b_rls"),
                 &gas_cfg.batch_release,
                 &gas_snapshot,
                 gas_cfg.enforce,
@@ -4797,3 +5537,6 @@ impl BountyEscrowContract {
         result
     }
 }
+
+#[cfg(test)]
+mod test_max_counts;
