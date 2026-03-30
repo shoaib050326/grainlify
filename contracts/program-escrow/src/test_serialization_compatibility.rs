@@ -91,6 +91,7 @@ fn serialization_compatibility_public_types_and_events() {
         reference_hash: None,
         archived: false,
         archived_at: None,
+        schema_version: STORAGE_SCHEMA_VERSION,
     };
 
     let program_initialized = ProgramInitializedEvent {

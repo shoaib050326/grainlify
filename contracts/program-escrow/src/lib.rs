@@ -671,6 +671,8 @@ pub struct ProgramData {
     pub archived: bool,
     pub archived_at: Option<u64>,
     pub status: ProgramStatus,
+    /// Schema version stamped at creation; immutable after init.
+    pub schema_version: u32,
 }
 
 // ========================================================================
@@ -1357,6 +1359,7 @@ impl ProgramEscrowContract {
             archived: false,
             archived_at: None,
             status: ProgramStatus::Draft,
+            schema_version: STORAGE_SCHEMA_VERSION,
         };
 
         // Store program data in registry
@@ -1692,6 +1695,7 @@ impl ProgramEscrowContract {
                 archived: false,
                 archived_at: None,
                 status: ProgramStatus::Draft,
+                schema_version: STORAGE_SCHEMA_VERSION,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);

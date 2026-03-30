@@ -22,7 +22,7 @@ use crate::{
         set_split_config, BeneficiarySplit, SplitConfig, SplitConfigSetEvent, SplitPayoutEvent,
         SplitPayoutResult, TOTAL_BASIS_POINTS,
     },
-    DataKey, ProgramData, ProgramMetadata, PROGRAM_DATA,
+    DataKey, ProgramData, ProgramMetadata, PROGRAM_DATA, STORAGE_SCHEMA_VERSION,
 };
 
 // ===========================================================================
@@ -89,6 +89,7 @@ impl SplitTestEnv {
             reference_hash: None,
             archived: false,
             archived_at: None,
+            schema_version: STORAGE_SCHEMA_VERSION,
         };
         self.env
             .storage()

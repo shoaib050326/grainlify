@@ -8,7 +8,7 @@
 
 use crate::{
     upgrade_safety, AnonymousEscrow, BountyEscrowContract, BountyEscrowContractClient, DataKey,
-    EscrowStatus,
+    EscrowStatus, ESCROW_SCHEMA_VERSION,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
