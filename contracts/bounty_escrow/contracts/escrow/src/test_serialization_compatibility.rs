@@ -388,7 +388,8 @@ fn serialization_compatibility_public_types_and_events() {
             EmergencyWithdrawEvent {
                 admin: admin.clone(),
                 recipient: depositor.clone(),
-                amount: 1000, timestamp: 500,
+                amount: 1000,
+                timestamp: 500,
             }
             .into_val(&env),
         ),

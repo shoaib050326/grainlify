@@ -79,8 +79,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    BountyEscrowContract, BountyEscrowContractClient, DataKey, Error, EscrowStatus,
-    LockFundsItem, ReleaseFundsItem,
+    BountyEscrowContract, BountyEscrowContractClient, DataKey, Error, EscrowStatus, LockFundsItem,
+    ReleaseFundsItem,
 };
 
 // ---------------------------------------------------------------------------

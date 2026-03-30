@@ -35,16 +35,16 @@ mod test_risk_flags;
 mod traits;
 pub mod upgrade_safety;
 
+#[cfg(test)]
+mod test_batch_failure_mode;
+#[cfg(test)]
+mod test_batch_failure_modes;
 #[cfg(feature = "legacy-tests")]
 mod test_frozen_balance;
 #[cfg(feature = "legacy-tests")]
 mod test_reentrancy_guard;
 #[cfg(all(test, feature = "legacy-tests"))]
 mod test_timelock;
-#[cfg(test)]
-mod test_batch_failure_mode;
-#[cfg(test)]
-mod test_batch_failure_modes;
 
 // ── Remaining test modules gated behind legacy-tests ─────────────────────────
 // These files exist and contain tests but require API migration before they can
