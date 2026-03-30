@@ -3952,7 +3952,7 @@ impl BountyEscrowContract {
 
         client.transfer(&env.current_contract_address(), &contributor, &net_payout);
 
-        emit_funds_released(
+       emit_funds_released(
             &env,
             FundsReleased {
                 version: EVENT_VERSION_V2,
@@ -3968,6 +3968,10 @@ impl BountyEscrowContract {
             contributor.clone(),
             bounty_id,
         );
+
+        // INV-2: Verify aggregate balance matches token balance after release.
+        multitoken_invariants::assert_after_disbursement(&env);
+
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -5012,7 +5016,7 @@ impl BountyEscrowContract {
             env.storage().persistent().remove(&approval_key);
         }
 
-        emit_funds_refunded(
+       emit_funds_refunded(
             &env,
             FundsRefunded {
                 version: EVENT_VERSION_V2,
@@ -5027,6 +5031,9 @@ impl BountyEscrowContract {
                 },
             },
         );
+
+        // INV-2: Verify aggregate balance matches token balance after anon refund.
+        multitoken_invariants::assert_after_disbursement(&env);
 
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
@@ -5535,7 +5542,7 @@ impl BountyEscrowContract {
                 );
             }
 
-            // Emit batch event
+           // Emit batch event
             emit_batch_funds_released(
                 &env,
                 BatchFundsReleased {
@@ -5545,9 +5552,12 @@ impl BountyEscrowContract {
                 },
             );
 
+            // INV-2: Verify aggregate balance matches token balance after batch release.
+            multitoken_invariants::assert_after_disbursement(&env);
+
             Ok(released_count)
         })();
-
+        
         // Gas budget cap enforcement (test / testutils only).
         #[cfg(any(test, feature = "testutils"))]
         if result.is_ok() {
