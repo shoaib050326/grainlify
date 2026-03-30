@@ -34,29 +34,36 @@ use soroban_sdk::{
 // ============================================================================
 
 /// Validation rules for human-readable identifiers to prevent malicious or confusing inputs.
-/// 
-/// This module provides consistent validation across all contracts for:
-/// - Bounty types and metadata
-/// - Any user-provided string identifiers
-/// 
-/// Rules enforced:
-/// - Maximum length limits to prevent UI/log issues
-/// - Allowed character sets (alphanumeric, spaces, safe punctuation)
-/// - No control characters that could cause display issues
-/// - No leading/trailing whitespace
-mod validation {
+///
+/// Current on-chain guarantees:
+/// - Non-empty values only
+/// - Maximum length limits to prevent storage and log blow-ups
+/// - Deterministic panic messages at the length boundaries
+///
+/// Roadmap:
+/// - Soroban SDK currently gives this contract limited character-level inspection tools.
+/// - Until richer string iteration/normalization is practical on-chain, Unicode scalars
+///   accepted by the SDK are allowed as-is when they fit within the length bound.
+/// - Additional character-class or whitespace normalization rules should be added only when
+///   they can be enforced consistently across all callers and test environments.
+pub(crate) mod validation {
     use soroban_sdk::Env;
 
     /// Maximum length for bounty types and short identifiers
-    const MAX_TAG_LEN: usize = 50;
+    pub(crate) const MAX_TAG_LEN: usize = 50;
 
     /// Validates a tag, type, or short identifier.
-    /// 
+    ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `tag` - The tag string to validate
     /// * `field_name` - Name of the field for error messages
-    /// 
+    ///
+    /// # Guarantees
+    /// - Rejects empty strings
+    /// - Rejects values longer than [`MAX_TAG_LEN`]
+    /// - Accepts SDK-permitted Unicode without additional normalization
+    ///
     /// # Panics
     /// Panics if validation fails with a descriptive error message.
     pub fn validate_tag(_env: &Env, tag: &soroban_sdk::String, field_name: &str) {
@@ -3167,6 +3174,7 @@ impl BountyEscrowContract {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         stored_admin.require_auth();
+        validation::validate_tag(&env, &bounty_type, "bounty_type");
 
         let metadata = EscrowMetadata {
             repo_id,

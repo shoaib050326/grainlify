@@ -491,6 +491,9 @@ pub struct DeprecationStateChanged {
 
 pub fn emit_deprecation_state_changed(env: &Env, event: DeprecationStateChanged) {
     let topics = (symbol_short!("deprec"),);
+    env.events().publish(topics, event);
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataUpdated {
