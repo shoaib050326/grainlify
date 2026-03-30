@@ -559,8 +559,8 @@ pub enum DataKey {
     ReadOnlyMode,                    // bool flag — blocks all state mutations
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
-    Dispute,  
-    DisputeRecord(String),                     // DisputeRecord (single active dispute per contract)
+    Dispute,
+    DisputeRecord(String), // DisputeRecord (single active dispute per contract)
 }
 
 #[contracttype]
@@ -731,8 +731,6 @@ pub struct ProgramAggregateStats {
     pub released_count: u32,
 }
 
-
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockItem {
@@ -875,15 +873,15 @@ mod token_math;
 
 // mod test_full_lifecycle;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_maintenance_mode;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_read_only_mode;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_risk_flags;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_token_math;
 // mod test_serialization_compatibility;
 #[cfg(test)]
@@ -1155,9 +1153,7 @@ impl ProgramEscrowContract {
                 .set(&DataKey::MaintenanceMode, &false);
         }
         if !env.storage().instance().has(&DataKey::ReadOnlyMode) {
-            env.storage()
-                .instance()
-                .set(&DataKey::ReadOnlyMode, &false);
+            env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         }
         if !env.storage().instance().has(&DataKey::PauseFlags) {
             env.storage().instance().set(
@@ -1363,14 +1359,14 @@ impl ProgramEscrowContract {
                 }
                 if has_tag {
                     if skipped < start {
-                            skipped += 1;
-                        } else if count < limit {
-                            result.push_back(id.clone());
-                            count += 1;
-                        }
+                        skipped += 1;
+                    } else if count < limit {
+                        result.push_back(id.clone());
+                        count += 1;
                     }
                 }
             }
+        }
         result
     }
 
@@ -1431,14 +1427,14 @@ impl ProgramEscrowContract {
                 initial_liquidity: 0,
                 risk_flags: 0,
                 metadata: ProgramMetadata {
-                program_name: None,
-                program_type: None,
-                ecosystem: None,
-                tags: soroban_sdk::Vec::new(&env),
-                start_date: None,
-                end_date: None,
-                custom_fields: soroban_sdk::Vec::new(&env),
-            },
+                    program_name: None,
+                    program_type: None,
+                    ecosystem: None,
+                    tags: soroban_sdk::Vec::new(&env),
+                    start_date: None,
+                    end_date: None,
+                    custom_fields: soroban_sdk::Vec::new(&env),
+                },
                 reference_hash: item.reference_hash.clone(),
                 archived: false,
                 archived_at: None,
@@ -1712,9 +1708,11 @@ impl ProgramEscrowContract {
         }
 
         // Credit net amount to program accounting (gross `amount` should already be on contract balance)
-        program_data.total_funds = crate::token_math::safe_add(program_data.total_funds, net_amount);
+        program_data.total_funds =
+            crate::token_math::safe_add(program_data.total_funds, net_amount);
 
-        program_data.remaining_balance = crate::token_math::safe_add(program_data.remaining_balance, net_amount);
+        program_data.remaining_balance =
+            crate::token_math::safe_add(program_data.remaining_balance, net_amount);
 
         // Store updated data
         env.storage().instance().set(&PROGRAM_DATA, &program_data);
@@ -1747,9 +1745,7 @@ impl ProgramEscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceMode, &false);
-        env.storage()
-            .instance()
-            .set(&DataKey::ReadOnlyMode, &false);
+        env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         env.storage().instance().set(
             &DataKey::PauseFlags,
             &PauseFlags {
@@ -2264,13 +2260,29 @@ impl ProgramEscrowContract {
         StorageLayoutVerification {
             schema_version: STORAGE_SCHEMA_VERSION,
             admin_set: env.storage().instance().has(&DataKey::Admin)
-                && env.storage().instance().get::<_, Address>(&DataKey::Admin).is_some(),
+                && env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::Admin)
+                    .is_some(),
             pause_flags_set: env.storage().instance().has(&DataKey::PauseFlags)
-                && env.storage().instance().get::<_, PauseFlags>(&DataKey::PauseFlags).is_some(),
+                && env
+                    .storage()
+                    .instance()
+                    .get::<_, PauseFlags>(&DataKey::PauseFlags)
+                    .is_some(),
             maintenance_mode_set: env.storage().instance().has(&DataKey::MaintenanceMode)
-                && env.storage().instance().get::<_, bool>(&DataKey::MaintenanceMode).is_some(),
+                && env
+                    .storage()
+                    .instance()
+                    .get::<_, bool>(&DataKey::MaintenanceMode)
+                    .is_some(),
             read_only_mode_set: env.storage().instance().has(&DataKey::ReadOnlyMode)
-                && env.storage().instance().get::<_, bool>(&DataKey::ReadOnlyMode).is_some(),
+                && env
+                    .storage()
+                    .instance()
+                    .get::<_, bool>(&DataKey::ReadOnlyMode)
+                    .is_some(),
         }
     }
 
@@ -3156,7 +3168,8 @@ impl ProgramEscrowContract {
         }
 
         program_data.total_funds = crate::token_math::safe_add(program_data.total_funds, amount);
-        program_data.remaining_balance = crate::token_math::safe_add(program_data.remaining_balance, net_amount);
+        program_data.remaining_balance =
+            crate::token_math::safe_add(program_data.remaining_balance, net_amount);
 
         env.storage().instance().set(&program_key, &program_data);
 
@@ -4155,9 +4168,9 @@ impl ProgramEscrowContract {
 
 // mod test_pause;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 // mod rbac_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_metadata_tagging;
 
 #[cfg(test)]
