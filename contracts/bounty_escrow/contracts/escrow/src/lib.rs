@@ -5377,7 +5377,6 @@ impl BountyEscrowContract {
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
         client.transfer(&env.current_contract_address(), &refund_to, &amount);
-
         emit_funds_refunded(
             &env,
             FundsRefunded {
