@@ -414,6 +414,13 @@ pub struct ProgramMetadataUpdatedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramMetadataField {
+    pub key: String,
+    pub value: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramMetadata {
     pub program_name: Option<String>,
     pub program_type: Option<String>,
@@ -421,7 +428,7 @@ pub struct ProgramMetadata {
     pub tags: Vec<String>,
     pub start_date: Option<u64>,
     pub end_date: Option<u64>,
-    pub custom_fields: Vec<(String, String)>,
+    pub custom_fields: Vec<ProgramMetadataField>,
 }
 
 #[contracttype]
