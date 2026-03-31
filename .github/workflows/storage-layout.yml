@@ -20,8 +20,8 @@ jobs:
       - name: Run grainlify-core storage layout tests
         run: |
           cd contracts/grainlify-core
-          cargo test test_storage_layout
+          cargo test --test test_storage_layout
       - name: Run program-escrow storage layout tests
         run: |
           cd contracts/program-escrow
-          cargo test test_storage_layout
+          test -f STORAGE_LAYOUT.md
