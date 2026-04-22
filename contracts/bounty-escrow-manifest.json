@@ -292,9 +292,131 @@
         "authorization": "admin",
         "pausable": true,
         "gas_estimate": "high"
+      },
+      {
+        "name": "set_filter_mode",
+        "description": "Set active participant filter mode",
+        "parameters": [
+          {
+            "name": "mode",
+            "type": "ParticipantFilterMode",
+            "description": "Disabled, BlocklistOnly, or AllowlistOnly"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "set_whitelist_entry",
+        "description": "Add or remove a participant from allowlist",
+        "parameters": [
+          {
+            "name": "address",
+            "type": "Address",
+            "description": "Participant address"
+          },
+          {
+            "name": "whitelisted",
+            "type": "bool",
+            "description": "True to add, false to remove"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "set_blocklist_entry",
+        "description": "Add or remove a participant from blocklist",
+        "parameters": [
+          {
+            "name": "address",
+            "type": "Address",
+            "description": "Participant address"
+          },
+          {
+            "name": "blocked",
+            "type": "bool",
+            "description": "True to add, false to remove"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ],
     "view": [
+      {
+        "name": "get_filter_mode",
+        "description": "Get current participant filter mode",
+        "parameters": [],
+        "returns": {
+          "type": "ParticipantFilterMode",
+          "description": "Current participant filter mode"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "query_whitelist",
+        "description": "Get paginated allowlist participants",
+        "parameters": [
+          {
+            "name": "offset",
+            "type": "u32",
+            "description": "Zero-based start index"
+          },
+          {
+            "name": "limit",
+            "type": "u32",
+            "description": "Maximum number of results"
+          }
+        ],
+        "returns": {
+          "type": "Vec<Address>",
+          "description": "Allowlisted participant addresses"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "query_blocklist",
+        "description": "Get paginated blocklist participants",
+        "parameters": [
+          {
+            "name": "offset",
+            "type": "u32",
+            "description": "Zero-based start index"
+          },
+          {
+            "name": "limit",
+            "type": "u32",
+            "description": "Maximum number of results"
+          }
+        ],
+        "returns": {
+          "type": "Vec<Address>",
+          "description": "Blocklisted participant addresses"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
       {
         "name": "get_escrow",
         "description": "Get escrow details by bounty ID",
@@ -762,6 +884,18 @@
         "type": "temporary",
         "description": "Reentrancy protection flag",
         "data_structure": "bool"
+      },
+      {
+        "name": "WhitelistIndex",
+        "type": "instance",
+        "description": "Paginated index of allowlisted addresses",
+        "data_structure": "Vec<Address>"
+      },
+      {
+        "name": "BlocklistIndex",
+        "type": "instance",
+        "description": "Paginated index of blocklisted addresses",
+        "data_structure": "Vec<Address>"
       }
     ]
   },
