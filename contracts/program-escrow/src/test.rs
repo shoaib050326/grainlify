@@ -1939,6 +1939,57 @@ fn test_batch_payout_atomicity_all_or_nothing() {
 }
 
 #[test]
+fn test_spend_threshold_single_payout_at_boundary_allowed() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipient = Address::generate(&env);
+    let data = client.single_payout(&recipient, &10_000);
+
+    assert_eq!(data.remaining_balance, 40_000);
+    assert_eq!(token_client.balance(&recipient), 10_000);
+}
+
+#[test]
+#[should_panic(expected = "Spend threshold exceeded")]
+fn test_spend_threshold_single_payout_above_limit_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipient = Address::generate(&env);
+    client.single_payout(&recipient, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Spend threshold exceeded")]
+fn test_spend_threshold_batch_total_above_limit_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipients = vec![&env, Address::generate(&env), Address::generate(&env)];
+    let amounts = vec![&env, 6_000, 5_000];
+    client.batch_payout(&recipients, &amounts);
+}
+
+#[test]
+#[should_panic(expected = "Invalid spend threshold")]
+fn test_spend_threshold_must_be_positive() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 1_000);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.set_program_spend_threshold(&program_id, &0);
+}
+
+#[test]
 fn test_batch_payout_sequential_batches() {
     // Test multiple sequential batch payouts to same program
     // Validates that history accumulates correctly
@@ -2131,6 +2182,43 @@ fn test_query_payouts_pagination_offset_and_limit() {
     // Page 3
     let page3 = client.query_payouts_by_recipient(&r1, &4, &2);
     assert_eq!(page3.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Pagination limit must be greater than zero")]
+fn test_query_payouts_pagination_limit_zero_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 100_000);
+    let r1 = Address::generate(&env);
+    client.single_payout(&r1, &10_000);
+    let _ = client.query_payouts_by_recipient(&r1, &0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Pagination limit exceeds maximum")]
+fn test_query_payouts_pagination_limit_above_max_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 100_000);
+    let r1 = Address::generate(&env);
+    client.single_payout(&r1, &10_000);
+    let _ = client.query_payouts_by_recipient(&r1, &0, &201);
+}
+
+#[test]
+#[should_panic(expected = "Invalid amount range")]
+fn test_query_payouts_by_amount_invalid_range_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 100_000);
+    let _ = client.query_payouts_by_amount(&1000, &100, &0, &10);
+}
+
+#[test]
+#[should_panic(expected = "Invalid timestamp range")]
+fn test_query_payouts_by_timestamp_invalid_range_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 100_000);
+    let now = env.ledger().timestamp();
+    let _ = client.query_payouts_by_timestamp(&(now + 10), &now, &0, &10);
 }
 
 #[test]
