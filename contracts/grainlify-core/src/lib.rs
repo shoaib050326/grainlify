@@ -676,21 +676,7 @@ mod test_strict_mode;
 /// - **Warnings**: Potential issues or incomplete runtime validation
 /// - **Info Messages**: Successful validation confirmations
 ///
-mod manifest_conformance {
-///
-/// This module provides comprehensive validation functions that ensure the contract's
-/// runtime behavior matches its declared manifest specification. It validates:
-/// - Entrypoint availability and signatures
-/// - Authorization requirements
-/// - Configuration parameters and defaults
-/// - Storage key usage
-/// - Event emission
-/// - Security features implementation
-/// - Access control mechanisms
-/// - Error handling scenarios
-///
-/// The harness is designed to be called during testing and deployment to ensure
-/// the contract implementation matches its specification.
+#[cfg(any(test, feature = "testutils"))]
 mod manifest_conformance {
     use super::*;
     use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
@@ -1293,11 +1279,10 @@ impl GrainlifyContract {
     /// # Security Note
     /// This is a view function and requires no authorization. It can be called
     /// by anyone to verify contract integrity.
+    #[cfg(any(test, feature = "testutils"))]
     pub fn validate_manifest_conformance(env: Env) -> manifest_conformance::ConformanceResult {
         manifest_conformance::ManifestHarness::validate_conformance(&env)
     }
-
-    /// Performs deep validation of contract behaviors and edge cases.
     ///
     /// This function goes beyond basic conformance checking to validate error handling,
     /// gas considerations, event emission patterns, and upgrade safety mechanisms.
@@ -1317,18 +1302,18 @@ impl GrainlifyContract {
     ///
     /// # Security Note
     /// This is a view function and requires no authorization.
+    #[cfg(any(test, feature = "testutils"))]
     pub fn validate_deep_conformance(env: Env) -> manifest_conformance::ConformanceResult {
         manifest_conformance::ManifestHarness::validate_deep_conformance(&env)
     }
-}
 
-#[cfg(all(test, feature = "wasm_tests"))]
-mod test {
-    use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, Events},
-        Env,
-    };
+    // ========================================================================
+    // Timelock Execution (continued from propose/approve flow)
+    // ========================================================================
+
+    /// Execute a multisig-approved upgrade after the timelock delay has elapsed.
+    pub fn execute_upgrade(env: Env, proposal_id: u64) {
+        let start = env.ledger().timestamp();
 
         let timelock_start: u64 = env
             .storage()
@@ -1950,12 +1935,12 @@ fn migrate_v1_to_v2(_env: &Env) {
     // Future: add data transformations here when needed
 }
 
-        let state = client.get_migration_state().unwrap();
-        assert_eq!(state.from_version, v_before);
-        assert_eq!(state.to_version, 3);
-    }
+#[cfg(test)]
+mod orphaned_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 
-    // ==================== MANIFEST CONFORMANCE TESTS ====================
+        // ==================== MANIFEST CONFORMANCE TESTS ====================
 
     #[test]
     fn test_manifest_conformance_uninitialized_contract() {
