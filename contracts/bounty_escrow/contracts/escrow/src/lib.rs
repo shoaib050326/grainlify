@@ -837,6 +837,10 @@ pub enum DataKey {
     RenewalHistory(u64),
     /// Per-bounty rollover chain link metadata.
     CycleLink(u64),
+    /// Ordered index of allowlisted participants for paginated queries.
+    WhitelistIndex,
+    /// Ordered index of blocklisted participants for paginated queries.
+    BlocklistIndex,
     /// Stored schema marker for refund-eligibility view semantics.
     RefundEligibilitySchemaVersion,
 }
@@ -1692,6 +1696,7 @@ impl BountyEscrowContract {
 
         let flags = Self::get_pause_flags(&env);
         if !flags.lock_paused {
+            reentrancy_guard::release(&env);
             return Err(Error::NotPaused);
         }
 
@@ -1736,6 +1741,61 @@ impl BountyEscrowContract {
             .instance()
             .get(&DataKey::ParticipantFilterMode)
             .unwrap_or(ParticipantFilterMode::Disabled)
+    }
+
+    fn read_participant_index(env: &Env, key: DataKey) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(Vec::<Address>::new(env))
+    }
+
+    fn write_participant_index(env: &Env, key: DataKey, values: &Vec<Address>) {
+        env.storage().instance().set(&key, values);
+    }
+
+    fn index_contains(values: &Vec<Address>, needle: &Address) -> bool {
+        for value in values.iter() {
+            if value == needle.clone() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn index_insert_unique(values: &mut Vec<Address>, value: Address) {
+        if !Self::index_contains(values, &value) {
+            values.push_back(value);
+        }
+    }
+
+    fn index_remove(env: &Env, values: &Vec<Address>, value: &Address) -> Vec<Address> {
+        let mut filtered = Vec::<Address>::new(env);
+        for entry in values.iter() {
+            if entry != value.clone() {
+                filtered.push_back(entry);
+            }
+        }
+        filtered
+    }
+
+    fn paginate_addresses(env: &Env, values: Vec<Address>, offset: u32, limit: u32) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new(env);
+        }
+        let len = values.len();
+        if offset >= len {
+            return Vec::new(env);
+        }
+        let mut out = Vec::new(env);
+        let mut i = offset;
+        while i < len && out.len() < limit {
+            if let Some(value) = values.get(i) {
+                out.push_back(value);
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Enforces participant filtering: returns Err if the address is not allowed to participate
@@ -2057,8 +2117,103 @@ impl BountyEscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
-        anti_abuse::set_whitelist(&env, address, whitelisted);
+        anti_abuse::set_whitelist(&env, address.clone(), whitelisted);
+        let mut index = Self::read_participant_index(&env, DataKey::WhitelistIndex);
+        if whitelisted {
+            Self::index_insert_unique(&mut index, address.clone());
+        } else {
+            index = Self::index_remove(&env, &index, &address);
+        }
+        Self::write_participant_index(&env, DataKey::WhitelistIndex, &index);
+        events::emit_participant_filter_entry_updated(
+            &env,
+            events::ParticipantFilterEntryUpdated {
+                version: EVENT_VERSION_V2,
+                list_type: events::ParticipantFilterListType::Allowlist,
+                address,
+                enabled: whitelisted,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         Ok(())
+    }
+
+    pub fn set_whitelist_entry(
+        env: Env,
+        address: Address,
+        whitelisted: bool,
+    ) -> Result<(), Error> {
+        Self::set_whitelist(env, address, whitelisted)
+    }
+
+    pub fn set_blocklist(env: Env, address: Address, blocked: bool) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        anti_abuse::set_blocklist(&env, address.clone(), blocked);
+        let mut index = Self::read_participant_index(&env, DataKey::BlocklistIndex);
+        if blocked {
+            Self::index_insert_unique(&mut index, address.clone());
+        } else {
+            index = Self::index_remove(&env, &index, &address);
+        }
+        Self::write_participant_index(&env, DataKey::BlocklistIndex, &index);
+        events::emit_participant_filter_entry_updated(
+            &env,
+            events::ParticipantFilterEntryUpdated {
+                version: EVENT_VERSION_V2,
+                list_type: events::ParticipantFilterListType::Blocklist,
+                address,
+                enabled: blocked,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn set_blocklist_entry(env: Env, address: Address, blocked: bool) -> Result<(), Error> {
+        Self::set_blocklist(env, address, blocked)
+    }
+
+    pub fn set_filter_mode(env: Env, mode: ParticipantFilterMode) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        let previous_mode = Self::get_participant_filter_mode(&env);
+        env.storage().instance().set(&DataKey::ParticipantFilterMode, &mode);
+        emit_participant_filter_mode_changed(
+            &env,
+            ParticipantFilterModeChanged {
+                previous_mode,
+                new_mode: mode,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_filter_mode(env: Env) -> ParticipantFilterMode {
+        Self::get_participant_filter_mode(&env)
+    }
+
+    /// Return a deterministic page of allowlisted addresses.
+    pub fn query_whitelist(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let values = Self::read_participant_index(&env, DataKey::WhitelistIndex);
+        Self::paginate_addresses(&env, values, offset, limit)
+    }
+
+    /// Return a deterministic page of blocklisted addresses.
+    pub fn query_blocklist(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let values = Self::read_participant_index(&env, DataKey::BlocklistIndex);
+        Self::paginate_addresses(&env, values, offset, limit)
     }
 
     fn next_capability_id(env: &Env) -> BytesN<32> {
@@ -2709,7 +2864,10 @@ impl BountyEscrowContract {
         soroban_sdk::log!(&env, "check paused ok");
 
         // 4. Participant filtering and rate limiting
-        Self::check_participant_filter(&env, depositor.clone())?;
+        if let Err(err) = Self::check_participant_filter(&env, depositor.clone()) {
+            reentrancy_guard::release(&env);
+            return Err(err);
+        }
         soroban_sdk::log!(&env, "start lock_funds");
         anti_abuse::check_rate_limit(&env, depositor.clone());
         soroban_sdk::log!(&env, "rate limit ok");
@@ -2782,20 +2940,24 @@ impl BountyEscrowContract {
         // Fee must never exceed the deposit; guard against misconfiguration.
         let net_amount = amount.checked_sub(fee_amount).unwrap_or(amount);
         if net_amount <= 0 {
+            reentrancy_guard::release(&env);
             return Err(Error::InvalidAmount);
         }
 
         // Transfer fee to recipient immediately (separate transfer so it is
         // visible as a distinct on-chain operation).
         if fee_amount > 0 {
-            Self::route_fee(
+            if let Err(err) = Self::route_fee(
                 &env,
                 &client,
                 &fee_config,
                 fee_amount,
                 lock_fee_rate,
                 events::FeeOperationType::Lock,
-            )?;
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(err);
+            }
         }
         soroban_sdk::log!(&env, "fee ok");
 

@@ -842,6 +842,32 @@ pub fn emit_participant_filter_mode_changed(env: &Env, event: ParticipantFilterM
     env.events().publish(topics, event);
 }
 
+/// Which participant list was mutated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParticipantFilterListType {
+    Allowlist,
+    Blocklist,
+}
+
+/// Payload for participant list entry mutation events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantFilterEntryUpdated {
+    pub version: u32,
+    pub list_type: ParticipantFilterListType,
+    pub address: Address,
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`ParticipantFilterEntryUpdated`]
+pub fn emit_participant_filter_entry_updated(env: &Env, event: ParticipantFilterEntryUpdated) {
+    let topics = (symbol_short!("pf_entry"),);
+    env.events().publish(topics, event);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // RISK FLAG EVENTS
 // ═══════════════════════════════════════════════════════════════════════════════
