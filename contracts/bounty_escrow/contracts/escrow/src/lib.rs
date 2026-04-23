@@ -1421,6 +1421,75 @@ impl BountyEscrowContract {
         Ok(())
     }
 
+    /// Returns the effective runtime cap for `batch_lock_funds`.
+    ///
+    /// Falls back to the compile-time `MAX_BATCH_SIZE` when no admin-configured
+    /// cap has been stored, ensuring the contract is safe out-of-the-box.
+    fn get_max_batch_size(env: Env) -> u32 {
+        Self::get_batch_size_caps_internal(&env).lock_cap
+    }
+
+    /// Returns the effective runtime cap for `batch_release_funds`.
+    fn get_max_release_batch_size(env: Env) -> u32 {
+        Self::get_batch_size_caps_internal(&env).release_cap
+    }
+
+    /// View: returns the effective batch size caps for lock and release operations.
+    ///
+    /// When no caps have been configured by the admin, returns the compile-time
+    /// hard limit (`MAX_BATCH_SIZE`) for both fields.
+    pub fn get_batch_size_caps(env: Env) -> BatchSizeCaps {
+        Self::get_batch_size_caps_internal(&env)
+    }
+
+    /// Admin: configure independent batch size caps for lock and release operations.
+    ///
+    /// Both caps must satisfy `1 <= cap <= MAX_BATCH_SIZE` (currently 20).
+    /// Setting a cap lower than the hard limit lets operators reduce the maximum
+    /// gas footprint of a single batch call without redeploying the contract.
+    ///
+    /// # Errors
+    /// * `NotInitialized`     — contract not yet initialised
+    /// * `InvalidBatchSizeCap` — either cap is 0 or exceeds `MAX_BATCH_SIZE`
+    ///
+    /// # Events
+    /// Emits [`events::BatchSizeCapsUpdated`] with previous and new values.
+    pub fn set_batch_size_caps(
+        env: Env,
+        lock_cap: u32,
+        release_cap: u32,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let new_caps = BatchSizeCaps { lock_cap, release_cap };
+        Self::validate_batch_size_caps(&new_caps)?;
+
+        let previous = Self::get_batch_size_caps_internal(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchSizeCaps, &new_caps);
+
+        events::emit_batch_size_caps_updated(
+            &env,
+            events::BatchSizeCapsUpdated {
+                version: EVENT_VERSION_V2,
+                previous_lock_cap: previous.lock_cap,
+                new_lock_cap: lock_cap,
+                previous_release_cap: previous.release_cap,
+                new_release_cap: release_cap,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     /// Validates treasury destinations before enabling multi-region routing.
     fn validate_treasury_destinations(
         _env: &Env,
@@ -5869,12 +5938,12 @@ impl BountyEscrowContract {
         #[cfg(any(test, feature = "testutils"))]
         let gas_snapshot = gas_budget::capture(&env);
         let result: Result<u32, Error> = (|| {
-            // Validate batch size
+            // Validate batch size against the release-specific runtime cap.
             let batch_size = items.len();
             if batch_size == 0 {
                 return Err(Error::InvalidBatchSize);
             }
-            let max_batch_size = Self::get_max_batch_size(env.clone());
+            let max_batch_size = Self::get_max_release_batch_size(env.clone());
             if batch_size as u32 > max_batch_size {
                 return Err(Error::InvalidBatchSize);
             }

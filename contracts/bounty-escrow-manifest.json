@@ -1,9 +1,9 @@
 {
   "$schema": "./contract-manifest-schema.json",
   "contract_name": "BountyEscrowContract",
-  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
+  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, runtime-configurable batch size caps, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.1.1",
+    "current": "2.4.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -54,6 +54,18 @@
           "Added InvalidBatchSizeCap error code for batch size governance",
           "Added BatchSizeCaps and FeeRoutingSchemaVersion DataKey variants for upgrade-safe storage",
           "Fee routing invariant is now enforced on-chain: last destination absorbs rounding remainder ensuring exact accounting"
+        ]
+      },
+      {
+        "version": "2.4.0",
+        "release_date": "2026-04-23",
+        "changes": [
+          "Added set_batch_size_caps admin entrypoint — independently configures lock and release batch caps at runtime",
+          "Added get_batch_size_caps view entrypoint — returns effective caps (defaults to MAX_BATCH_SIZE=20 when unconfigured)",
+          "batch_lock_funds now enforces the runtime lock_cap instead of the compile-time constant",
+          "batch_release_funds now enforces the runtime release_cap independently from the lock cap",
+          "Added BatchSizeCapsUpdated audit event emitted on every cap change with previous and new values",
+          "Upgrade-safe: caps stored under DataKey::BatchSizeCaps in instance storage; missing key falls back to MAX_BATCH_SIZE"
         ]
       }
     ]
@@ -876,6 +888,26 @@
         "authorization": "admin",
         "pausable": false,
         "gas_estimate": "low"
+      },
+      {
+        "name": "set_batch_size_caps",
+        "description": "Set independent runtime caps for batch_lock_funds and batch_release_funds. Both caps must satisfy 1 <= cap <= MAX_BATCH_SIZE (20). Emits BatchSizeCapsUpdated.",
+        "parameters": [
+          {
+            "name": "lock_cap",
+            "type": "u32",
+            "description": "Maximum items allowed in a single batch_lock_funds call (1..=20)"
+          },
+          {
+            "name": "release_cap",
+            "type": "u32",
+            "description": "Maximum items allowed in a single batch_release_funds call (1..=20)"
+          }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ]
   },
@@ -1049,6 +1081,12 @@
         "type": "instance",
         "description": "Paginated index of blocklisted addresses",
         "data_structure": "Vec<Address>"
+      },
+      {
+        "name": "BatchSizeCaps",
+        "type": "instance",
+        "description": "Runtime-configurable batch size caps for lock and release operations. Defaults to MAX_BATCH_SIZE (20) when absent.",
+        "data_structure": "BatchSizeCaps"
       }
     ]
   },
