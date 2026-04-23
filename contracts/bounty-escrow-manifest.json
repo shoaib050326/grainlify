@@ -1,9 +1,9 @@
 {
   "$schema": "./contract-manifest-schema.json",
   "contract_name": "BountyEscrowContract",
-  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
+  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, per-bounty fee routing invariants, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.1.1",
+    "current": "2.4.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -54,6 +54,23 @@
           "Added InvalidBatchSizeCap error code for batch size governance",
           "Added BatchSizeCaps and FeeRoutingSchemaVersion DataKey variants for upgrade-safe storage",
           "Fee routing invariant is now enforced on-chain: last destination absorbs rounding remainder ensuring exact accounting"
+        ]
+      },
+      {
+        "version": "2.4.0",
+        "release_date": "2026-04-23",
+        "changes": [
+          "Added per-bounty fee routing invariants (Issue #50)",
+          "New set_fee_routing entrypoint: admin sets treasury/partner split (basis points) per bounty; shares must sum to 10 000",
+          "New get_fee_routing view: returns PerBountyFeeRouting or None when no override is set",
+          "New PerBountyFeeRouting storage type with treasury_recipient, treasury_bps, partner_recipient, partner_bps",
+          "New DataKey::PerBountyFeeRouting(u64) for upgrade-safe persistent storage",
+          "route_fee_for_bounty internal helper: uses per-bounty routing when set, falls back to global route_fee",
+          "Emits FeeRoutingUpdated event on set_fee_routing for audit trail",
+          "Emits FeeRouted event on every per-bounty fee split for indexer visibility",
+          "Emits FeeRoutingInvariantChecked event proving distributed_total == fee_amount on every per-bounty routing call",
+          "Invariant enforced on-chain: panic if distributed != fee_amount (impossible in correct execution)",
+          "All lock, release, and recurring-lock paths now use route_fee_for_bounty"
         ]
       }
     ]
@@ -876,9 +893,65 @@
         "authorization": "admin",
         "pausable": false,
         "gas_estimate": "low"
+      },
+      {
+        "name": "set_fee_routing",
+        "description": "Set a per-bounty fee routing override. Fees collected for this bounty are split between treasury_recipient and an optional partner_recipient according to the supplied basis-point shares. treasury_bps + partner_bps must equal 10 000. Emits FeeRoutingUpdated.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty to configure routing for. Must exist."
+          },
+          {
+            "name": "treasury_recipient",
+            "type": "Address",
+            "description": "Primary treasury address that receives its share of the fee."
+          },
+          {
+            "name": "treasury_bps",
+            "type": "i128",
+            "description": "Treasury share in basis points (0–10 000). Must equal 10 000 when no partner."
+          },
+          {
+            "name": "partner_recipient",
+            "type": "Option<Address>",
+            "description": "Optional partner/referral address.",
+            "optional": true
+          },
+          {
+            "name": "partner_bps",
+            "type": "i128",
+            "description": "Partner share in basis points (0–10 000). Must be 0 when partner_recipient is None."
+          }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ]
   },
+  "view_entrypoints_fee_routing": [
+    {
+      "name": "get_fee_routing",
+      "description": "Return the per-bounty fee routing override for bounty_id, or None when no override is set.",
+      "parameters": [
+        {
+          "name": "bounty_id",
+          "type": "u64",
+          "description": "Bounty identifier"
+        }
+      ],
+      "returns": {
+        "type": "Option<PerBountyFeeRouting>",
+        "description": "Per-bounty routing config, or None if using global routing."
+      },
+      "authorization": "any",
+      "pausable": false,
+      "gas_estimate": "low"
+    }
+  ],
   "configuration": {
     "parameters": [
       {
@@ -1049,6 +1122,12 @@
         "type": "instance",
         "description": "Paginated index of blocklisted addresses",
         "data_structure": "Vec<Address>"
+      },
+      {
+        "name": "PerBountyFeeRouting",
+        "type": "persistent",
+        "description": "Per-bounty fee routing override keyed by bounty_id. When present, overrides global treasury routing for that bounty.",
+        "data_structure": "PerBountyFeeRouting"
       }
     ]
   },

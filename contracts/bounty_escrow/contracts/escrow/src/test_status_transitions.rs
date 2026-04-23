@@ -955,3 +955,316 @@ fn test_claim_window_expired_event_emitted_on_failure() {
     });
     assert!(found, "ClaimWindowExpired event not emitted");
 }
+
+// ============================================================================
+// FEE ROUTING INVARIANTS TESTS (Issue #50)
+// ============================================================================
+
+/// Helper: configure a 2% lock fee and 1% release fee on the global config.
+fn setup_fee_config(setup: &TestSetup, fee_recipient: &Address) {
+    setup.escrow.update_fee_config(
+        &Some(200i128),  // 2% lock fee
+        &Some(100i128),  // 1% release fee
+        &None,
+        &None,
+        &Some(fee_recipient.clone()),
+        &Some(true),
+    );
+}
+
+// --- set_fee_routing: basic happy path ---
+
+#[test]
+fn test_set_fee_routing_treasury_only() {
+    let setup = TestSetup::new();
+    let bounty_id = 400u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    let treasury = Address::generate(&setup.env);
+    // treasury_bps = 10_000 (100%), no partner
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
+
+    let routing = setup.escrow.get_fee_routing(&bounty_id).expect("routing must be set");
+    assert_eq!(routing.treasury_recipient, treasury);
+    assert_eq!(routing.treasury_bps, 10_000);
+    assert!(routing.partner_recipient.is_none());
+    assert_eq!(routing.partner_bps, 0);
+}
+
+#[test]
+fn test_set_fee_routing_with_partner() {
+    let setup = TestSetup::new();
+    let bounty_id = 401u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    let treasury = Address::generate(&setup.env);
+    let partner = Address::generate(&setup.env);
+    // 80% treasury, 20% partner
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &8_000i128, &Some(partner.clone()), &2_000i128);
+
+    let routing = setup.escrow.get_fee_routing(&bounty_id).expect("routing must be set");
+    assert_eq!(routing.treasury_bps, 8_000);
+    assert_eq!(routing.partner_recipient, Some(partner));
+    assert_eq!(routing.partner_bps, 2_000);
+}
+
+// --- set_fee_routing: invariant violations ---
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_set_fee_routing_shares_dont_sum_to_10000_rejected() {
+    let setup = TestSetup::new();
+    let bounty_id = 402u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    let treasury = Address::generate(&setup.env);
+    let partner = Address::generate(&setup.env);
+    // 70% + 20% = 90% — must be rejected (InvalidAmount = 13)
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &7_000i128, &Some(partner), &2_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_set_fee_routing_treasury_only_wrong_bps_rejected() {
+    let setup = TestSetup::new();
+    let bounty_id = 403u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    let treasury = Address::generate(&setup.env);
+    // No partner but treasury_bps != 10_000 — must be rejected
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &9_000i128, &None, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #202)")]
+fn test_set_fee_routing_bounty_not_found_rejected() {
+    let setup = TestSetup::new();
+    let treasury = Address::generate(&setup.env);
+    // Bounty 999 does not exist
+    setup.escrow.set_fee_routing(&999u64, &treasury, &10_000i128, &None, &0i128);
+}
+
+// --- get_fee_routing: returns None when not set ---
+
+#[test]
+fn test_get_fee_routing_returns_none_when_unset() {
+    let setup = TestSetup::new();
+    let bounty_id = 404u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    assert!(setup.escrow.get_fee_routing(&bounty_id).is_none());
+}
+
+// --- fee routing invariant: treasury-only routing ---
+
+#[test]
+fn test_fee_routing_treasury_only_receives_full_fee_on_lock() {
+    let setup = TestSetup::new();
+    let bounty_id = 405u64;
+    let gross = 100_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    let treasury = Address::generate(&setup.env);
+    let fee_recipient = Address::generate(&setup.env);
+
+    // Enable 2% lock fee globally
+    setup_fee_config(&setup, &fee_recipient);
+
+    // Lock first so bounty exists, then set routing
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    // fee = ceil(100_000 * 200 / 10_000) = 2_000 already went to fee_recipient (no routing yet)
+    // Now set routing for a NEW bounty
+    let bounty_id2 = 406u64;
+    setup.token_admin.mint(&setup.depositor, &gross);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id2, &gross, &deadline);
+    setup.escrow.set_fee_routing(&bounty_id2, &treasury, &10_000i128, &None, &0i128);
+
+    // Lock a third bounty that has routing pre-set — but routing is set after lock,
+    // so we test release routing instead.
+    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
+    let treasury_balance_before = token_client.balance(&treasury);
+
+    // Release bounty_id2 — release fee (1%) should go to treasury via per-bounty routing
+    setup.escrow.release_funds(&bounty_id2, &setup.contributor);
+
+    // release fee = ceil(net_amount * 100 / 10_000)
+    // net_amount after 2% lock fee = 100_000 - 2_000 = 98_000
+    // release fee = ceil(98_000 * 100 / 10_000) = 980
+    let treasury_balance_after = token_client.balance(&treasury);
+    assert_eq!(
+        treasury_balance_after - treasury_balance_before,
+        980,
+        "treasury must receive the full release fee via per-bounty routing"
+    );
+}
+
+#[test]
+fn test_fee_routing_partner_split_invariant_holds() {
+    let setup = TestSetup::new();
+    let bounty_id = 407u64;
+    let gross = 100_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    let treasury = Address::generate(&setup.env);
+    let partner = Address::generate(&setup.env);
+    let fee_recipient = Address::generate(&setup.env);
+
+    setup_fee_config(&setup, &fee_recipient);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    // Set 70/30 split for release fee
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &7_000i128, &Some(partner.clone()), &3_000i128);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
+    let treasury_before = token_client.balance(&treasury);
+    let partner_before = token_client.balance(&partner);
+
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // net_amount = 100_000 - 2_000 = 98_000
+    // release fee = ceil(98_000 * 100 / 10_000) = 980
+    // treasury share = floor(980 * 7_000 / 10_000) = 686
+    // partner share = 980 - 686 = 294
+    let treasury_after = token_client.balance(&treasury);
+    let partner_after = token_client.balance(&partner);
+
+    let treasury_received = treasury_after - treasury_before;
+    let partner_received = partner_after - partner_before;
+
+    // Invariant: treasury + partner == total fee
+    assert_eq!(
+        treasury_received + partner_received,
+        980,
+        "fee routing invariant: treasury + partner must equal total release fee"
+    );
+    assert_eq!(treasury_received, 686, "treasury must receive 70% of fee");
+    assert_eq!(partner_received, 294, "partner must receive 30% of fee");
+}
+
+// --- audit event emission ---
+
+#[test]
+fn test_set_fee_routing_emits_fee_routing_updated_event() {
+    let setup = TestSetup::new();
+    let bounty_id = 408u64;
+    let amount = 10_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    let treasury = Address::generate(&setup.env);
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
+
+    let events = setup.env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_rte").into_val(&setup.env))
+                .unwrap_or(false)
+    });
+    assert!(found, "FeeRoutingUpdated event must be emitted by set_fee_routing");
+}
+
+#[test]
+fn test_fee_routing_emits_fee_routed_event_on_release() {
+    let setup = TestSetup::new();
+    let bounty_id = 409u64;
+    let gross = 50_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    let treasury = Address::generate(&setup.env);
+    let fee_recipient = Address::generate(&setup.env);
+    setup_fee_config(&setup, &fee_recipient);
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let events = setup.env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_rt").into_val(&setup.env))
+                .unwrap_or(false)
+    });
+    assert!(found, "FeeRouted event must be emitted when per-bounty routing is active");
+}
+
+#[test]
+fn test_fee_routing_emits_invariant_checked_event() {
+    let setup = TestSetup::new();
+    let bounty_id = 410u64;
+    let gross = 50_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    let treasury = Address::generate(&setup.env);
+    let fee_recipient = Address::generate(&setup.env);
+    setup_fee_config(&setup, &fee_recipient);
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let events = setup.env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_inv").into_val(&setup.env))
+                .unwrap_or(false)
+    });
+    assert!(found, "FeeRoutingInvariantChecked event must be emitted");
+}
+
+// --- upgrade-safe schema version ---
+
+#[test]
+fn test_fee_routing_schema_version_set_on_init() {
+    let setup = TestSetup::new();
+    // FeeRoutingSchemaVersion must be written during init
+    let events = setup.env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_schm").into_val(&setup.env))
+                .unwrap_or(false)
+    });
+    assert!(found, "FeeRoutingSchemaVersionSet event must be emitted during init");
+}
+
+// --- fallback: no per-bounty routing uses global path ---
+
+#[test]
+fn test_no_per_bounty_routing_falls_back_to_global() {
+    let setup = TestSetup::new();
+    let bounty_id = 411u64;
+    let gross = 100_000i128;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    let fee_recipient = Address::generate(&setup.env);
+    setup_fee_config(&setup, &fee_recipient);
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    // No set_fee_routing call — global path should be used
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
+    // release fee = ceil(98_000 * 100 / 10_000) = 980 → goes to fee_recipient
+    assert_eq!(
+        token_client.balance(&fee_recipient),
+        // lock fee (2_000) + release fee (980)
+        2_980,
+        "global fee_recipient must receive both lock and release fees when no per-bounty routing"
+    );
+}
