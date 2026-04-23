@@ -799,6 +799,22 @@ pub fn emit_maintenance_mode_changed(env: &Env, event: MaintenanceModeChanged) {
     env.events().publish(topics, event);
 }
 
+/// V2 payload for maintenance mode changes (deterministic + audit-friendly).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceModeChangedV2 {
+    pub version: u32,
+    pub previous_enabled: bool,
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+pub fn emit_maintenance_mode_changed_v2(env: &Env, event: MaintenanceModeChangedV2) {
+    let topics = (symbol_short!("maint"), symbol_short!("v2"));
+    env.events().publish(topics, event);
+}
+
 /// Payload for the [`emit_participant_filter_mode_changed`] event.
 ///
 /// Emitted when the admin changes the participant filter mode.
@@ -823,6 +839,32 @@ pub struct ParticipantFilterModeChanged {
 /// Emit [`ParticipantFilterModeChanged`]
 pub fn emit_participant_filter_mode_changed(env: &Env, event: ParticipantFilterModeChanged) {
     let topics = (symbol_short!("pf_mode"),);
+    env.events().publish(topics, event);
+}
+
+/// Which participant list was mutated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParticipantFilterListType {
+    Allowlist,
+    Blocklist,
+}
+
+/// Payload for participant list entry mutation events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantFilterEntryUpdated {
+    pub version: u32,
+    pub list_type: ParticipantFilterListType,
+    pub address: Address,
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emit [`ParticipantFilterEntryUpdated`]
+pub fn emit_participant_filter_entry_updated(env: &Env, event: ParticipantFilterEntryUpdated) {
+    let topics = (symbol_short!("pf_entry"),);
     env.events().publish(topics, event);
 }
 

@@ -32,12 +32,13 @@ use crate::events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
-    emit_maintenance_mode_changed, emit_notification_preferences_updated,
+    emit_maintenance_mode_changed, emit_maintenance_mode_changed_v2,
+    emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
     emit_refund_approval_consumed, emit_refund_approval_set, emit_ticket_issued, BatchFundsLocked,
     BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
     CriticalOperationOutcome, DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked,
-    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged,
+    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged, MaintenanceModeChangedV2,
     NotificationPreferencesUpdated, ParticipantFilterModeChanged, RefundApprovalConsumed,
     RefundApprovalSet, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
     EVENT_VERSION_V2,
@@ -823,6 +824,12 @@ pub enum DataKey {
     NetworkId,
 
     MaintenanceMode, // bool flag
+    /// Timestamp when maintenance mode was last toggled.
+    MaintenanceModeUpdatedAt,
+    /// Admin that last toggled maintenance mode.
+    MaintenanceModeUpdatedBy,
+    /// Schema marker for maintenance mode hardening semantics.
+    MaintenanceModeSchemaVersion,
     /// Per-operation gas budget caps configured by the admin.
     /// See [`gas_budget::GasBudgetConfig`].
     GasBudgetConfig,
@@ -830,6 +837,10 @@ pub enum DataKey {
     RenewalHistory(u64),
     /// Per-bounty rollover chain link metadata.
     CycleLink(u64),
+    /// Ordered index of allowlisted participants for paginated queries.
+    WhitelistIndex,
+    /// Ordered index of blocklisted participants for paginated queries.
+    BlocklistIndex,
     /// Stored schema marker for refund-eligibility view semantics.
     RefundEligibilitySchemaVersion,
 }
@@ -960,6 +971,7 @@ pub struct ReleaseApproval {
 }
 
 const REFUND_ELIGIBILITY_SCHEMA_VERSION_V1: u32 = 1;
+const MAINTENANCE_MODE_SCHEMA_VERSION_V1: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1184,6 +1196,20 @@ impl BountyEscrowContract {
             &DataKey::RefundEligibilitySchemaVersion,
             &REFUND_ELIGIBILITY_SCHEMA_VERSION_V1,
         );
+        // Upgrade-safe maintenance mode initialization (explicit key write).
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceMode, &false);
+        env.storage().instance().set(
+            &DataKey::MaintenanceModeSchemaVersion,
+            &MAINTENANCE_MODE_SCHEMA_VERSION_V1,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_bounty_initialized(
             &env,
@@ -1670,6 +1696,7 @@ impl BountyEscrowContract {
 
         let flags = Self::get_pause_flags(&env);
         if !flags.lock_paused {
+            reentrancy_guard::release(&env);
             return Err(Error::NotPaused);
         }
 
@@ -1714,6 +1741,61 @@ impl BountyEscrowContract {
             .instance()
             .get(&DataKey::ParticipantFilterMode)
             .unwrap_or(ParticipantFilterMode::Disabled)
+    }
+
+    fn read_participant_index(env: &Env, key: DataKey) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(Vec::<Address>::new(env))
+    }
+
+    fn write_participant_index(env: &Env, key: DataKey, values: &Vec<Address>) {
+        env.storage().instance().set(&key, values);
+    }
+
+    fn index_contains(values: &Vec<Address>, needle: &Address) -> bool {
+        for value in values.iter() {
+            if value == needle.clone() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn index_insert_unique(values: &mut Vec<Address>, value: Address) {
+        if !Self::index_contains(values, &value) {
+            values.push_back(value);
+        }
+    }
+
+    fn index_remove(env: &Env, values: &Vec<Address>, value: &Address) -> Vec<Address> {
+        let mut filtered = Vec::<Address>::new(env);
+        for entry in values.iter() {
+            if entry != value.clone() {
+                filtered.push_back(entry);
+            }
+        }
+        filtered
+    }
+
+    fn paginate_addresses(env: &Env, values: Vec<Address>, offset: u32, limit: u32) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new(env);
+        }
+        let len = values.len();
+        if offset >= len {
+            return Vec::new(env);
+        }
+        let mut out = Vec::new(env);
+        let mut i = offset;
+        while i < len && out.len() < limit {
+            if let Some(value) = values.get(i) {
+                out.push_back(value);
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Enforces participant filtering: returns Err if the address is not allowed to participate
@@ -1984,13 +2066,41 @@ impl BountyEscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        let previous_enabled = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceMode)
+            .unwrap_or(false);
+
+        // Idempotent behavior: if no state change, do not emit events.
+        if previous_enabled == enabled {
+            return Ok(());
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceMode, &enabled);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_maintenance_mode_changed(
             &env,
             events::MaintenanceModeChanged {
+                enabled,
+                reason,
+                admin: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        emit_maintenance_mode_changed_v2(
+            &env,
+            MaintenanceModeChangedV2 {
+                version: EVENT_VERSION_V2,
+                previous_enabled,
                 enabled,
                 reason,
                 admin: admin.clone(),
@@ -2007,8 +2117,103 @@ impl BountyEscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
-        anti_abuse::set_whitelist(&env, address, whitelisted);
+        anti_abuse::set_whitelist(&env, address.clone(), whitelisted);
+        let mut index = Self::read_participant_index(&env, DataKey::WhitelistIndex);
+        if whitelisted {
+            Self::index_insert_unique(&mut index, address.clone());
+        } else {
+            index = Self::index_remove(&env, &index, &address);
+        }
+        Self::write_participant_index(&env, DataKey::WhitelistIndex, &index);
+        events::emit_participant_filter_entry_updated(
+            &env,
+            events::ParticipantFilterEntryUpdated {
+                version: EVENT_VERSION_V2,
+                list_type: events::ParticipantFilterListType::Allowlist,
+                address,
+                enabled: whitelisted,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         Ok(())
+    }
+
+    pub fn set_whitelist_entry(
+        env: Env,
+        address: Address,
+        whitelisted: bool,
+    ) -> Result<(), Error> {
+        Self::set_whitelist(env, address, whitelisted)
+    }
+
+    pub fn set_blocklist(env: Env, address: Address, blocked: bool) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        anti_abuse::set_blocklist(&env, address.clone(), blocked);
+        let mut index = Self::read_participant_index(&env, DataKey::BlocklistIndex);
+        if blocked {
+            Self::index_insert_unique(&mut index, address.clone());
+        } else {
+            index = Self::index_remove(&env, &index, &address);
+        }
+        Self::write_participant_index(&env, DataKey::BlocklistIndex, &index);
+        events::emit_participant_filter_entry_updated(
+            &env,
+            events::ParticipantFilterEntryUpdated {
+                version: EVENT_VERSION_V2,
+                list_type: events::ParticipantFilterListType::Blocklist,
+                address,
+                enabled: blocked,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn set_blocklist_entry(env: Env, address: Address, blocked: bool) -> Result<(), Error> {
+        Self::set_blocklist(env, address, blocked)
+    }
+
+    pub fn set_filter_mode(env: Env, mode: ParticipantFilterMode) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        let previous_mode = Self::get_participant_filter_mode(&env);
+        env.storage().instance().set(&DataKey::ParticipantFilterMode, &mode);
+        emit_participant_filter_mode_changed(
+            &env,
+            ParticipantFilterModeChanged {
+                previous_mode,
+                new_mode: mode,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_filter_mode(env: Env) -> ParticipantFilterMode {
+        Self::get_participant_filter_mode(&env)
+    }
+
+    /// Return a deterministic page of allowlisted addresses.
+    pub fn query_whitelist(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let values = Self::read_participant_index(&env, DataKey::WhitelistIndex);
+        Self::paginate_addresses(&env, values, offset, limit)
+    }
+
+    /// Return a deterministic page of blocklisted addresses.
+    pub fn query_blocklist(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let values = Self::read_participant_index(&env, DataKey::BlocklistIndex);
+        Self::paginate_addresses(&env, values, offset, limit)
     }
 
     fn next_capability_id(env: &Env) -> BytesN<32> {
@@ -2659,7 +2864,10 @@ impl BountyEscrowContract {
         soroban_sdk::log!(&env, "check paused ok");
 
         // 4. Participant filtering and rate limiting
-        Self::check_participant_filter(&env, depositor.clone())?;
+        if let Err(err) = Self::check_participant_filter(&env, depositor.clone()) {
+            reentrancy_guard::release(&env);
+            return Err(err);
+        }
         soroban_sdk::log!(&env, "start lock_funds");
         anti_abuse::check_rate_limit(&env, depositor.clone());
         soroban_sdk::log!(&env, "rate limit ok");
@@ -2732,20 +2940,24 @@ impl BountyEscrowContract {
         // Fee must never exceed the deposit; guard against misconfiguration.
         let net_amount = amount.checked_sub(fee_amount).unwrap_or(amount);
         if net_amount <= 0 {
+            reentrancy_guard::release(&env);
             return Err(Error::InvalidAmount);
         }
 
         // Transfer fee to recipient immediately (separate transfer so it is
         // visible as a distinct on-chain operation).
         if fee_amount > 0 {
-            Self::route_fee(
+            if let Err(err) = Self::route_fee(
                 &env,
                 &client,
                 &fee_config,
                 fee_amount,
                 lock_fee_rate,
                 events::FeeOperationType::Lock,
-            )?;
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(err);
+            }
         }
         soroban_sdk::log!(&env, "fee ok");
 
@@ -5492,197 +5704,6 @@ impl BountyEscrowContract {
             .get(&DataKey::Metadata(bounty_id));
 
         Ok(metadata.map(|m| m.risk_flags).unwrap_or(0))
-    }
-
-    // ============================================================================
-    // TWO-STEP ADMIN ROTATION WITH TIMELOCK
-    // ============================================================================
-
-    /// Represents a pending admin transfer.
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct AdminTransferState {
-        pub proposed_admin: Address,
-        pub available_at: u64,
-    }
-
-    const DEFAULT_ADMIN_TIMELOCK: u64 = 86400; // 24 hours default
-
-    /// Configures the minimum delay required before an admin transfer can be accepted.
-    pub fn set_admin_timelock(env: Env, duration: u64) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        // Enforce a minimum timelock of 5 minutes to prevent instant hijack bypasses
-        if duration < 300 {
-            return Err(Error::InvalidAmount);
-        }
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("adm_tlock"), &duration);
-
-        events::emit_admin_timelock_configured(
-            &env,
-            events::AdminTimelockConfigured {
-                version: events::EVENT_VERSION_V2,
-                admin,
-                duration,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Step 1: Current admin proposes a new admin. Starts the timelock countdown.
-    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        let duration = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("adm_tlock"))
-            .unwrap_or(DEFAULT_ADMIN_TIMELOCK);
-            
-        let available_at = env.ledger().timestamp().saturating_add(duration);
-
-        let state = AdminTransferState {
-            proposed_admin: new_admin.clone(),
-            available_at,
-        };
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("adm_xfer"), &state);
-
-        events::emit_admin_transfer_proposed(
-            &env,
-            events::AdminTransferProposed {
-                version: events::EVENT_VERSION_V2,
-                old_admin: admin,
-                new_admin,
-                available_at,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Cancels an active admin transfer proposal.
-    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        if let Some(state) = env
-            .storage()
-            .instance()
-            .get::<_, AdminTransferState>(&symbol_short!("adm_xfer"))
-        {
-            env.storage().instance().remove(&symbol_short!("adm_xfer"));
-            events::emit_admin_transfer_cancelled(
-                &env,
-                events::AdminTransferCancelled {
-                    version: events::EVENT_VERSION_V2,
-                    old_admin: admin,
-                    proposed_admin: state.proposed_admin,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Step 2: Proposed admin accepts the role. Fails if the timelock has not expired.
-    pub fn accept_admin(env: Env) -> Result<(), Error> {
-        let state = env
-            .storage()
-            .instance()
-            .get::<_, AdminTransferState>(&symbol_short!("adm_xfer"))
-            .ok_or(Error::Unauthorized)?;
-
-        // The NEW admin must be the one to sign and accept
-        state.proposed_admin.require_auth();
-
-        if env.ledger().timestamp() < state.available_at {
-            return Err(Error::DeadlineNotPassed);
-        }
-
-        let old_admin = rbac::require_admin(&env);
-
-        // Execute the transfer and clean up state
-        env.storage().instance().set(&DataKey::Admin, &state.proposed_admin);
-        env.storage().instance().remove(&symbol_short!("adm_xfer"));
-
-        events::emit_admin_transfer_accepted(
-            &env,
-            events::AdminTransferAccepted {
-                version: events::EVENT_VERSION_V2,
-                old_admin,
-                new_admin: state.proposed_admin,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// View: Gets the current pending admin transfer details.
-    pub fn get_pending_admin(env: Env) -> Option<AdminTransferState> {
-        env.storage().instance().get(&symbol_short!("adm_xfer"))
-    }
-
-    /// View: Gets the current configured admin timelock duration.
-    pub fn get_admin_timelock(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("adm_tlock"))
-            .unwrap_or(DEFAULT_ADMIN_TIMELOCK)
-    }
-
-    // ============================================================================
-    // BATCH SIZE GOVERNANCE
-    // ============================================================================
-
-    const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
-    const HARD_LIMIT_BATCH_SIZE: u32 = 100; // Prevents Soroban instruction/memory limit exploits
-
-    /// Updates the maximum allowed items in a single batch operation.
-    ///
-    /// # Access Control
-    /// Admin-only.
-    pub fn set_max_batch_size(env: Env, new_size: u32) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        if new_size == 0 || new_size > Self::HARD_LIMIT_BATCH_SIZE {
-            return Err(Error::InvalidAmount);
-        }
-
-        let old_size = Self::get_max_batch_size(env.clone());
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("max_batch"), &new_size);
-
-        events::emit_max_batch_size_updated(
-            &env,
-            events::MaxBatchSizeUpdated {
-                version: events::EVENT_VERSION_V2,
-                admin,
-                old_size,
-                new_size,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// View: Gets the current configured maximum batch size.
-    pub fn get_max_batch_size(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("max_batch"))
-            .unwrap_or(Self::DEFAULT_MAX_BATCH_SIZE)
     }
 }
 impl traits::EscrowInterface for BountyEscrowContract {
