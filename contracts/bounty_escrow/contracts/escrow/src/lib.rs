@@ -32,12 +32,13 @@ use crate::events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
-    emit_maintenance_mode_changed, emit_notification_preferences_updated,
+    emit_maintenance_mode_changed, emit_maintenance_mode_changed_v2,
+    emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
     emit_refund_approval_consumed, emit_refund_approval_set, emit_ticket_issued, BatchFundsLocked,
     BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
     CriticalOperationOutcome, DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked,
-    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged,
+    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged, MaintenanceModeChangedV2,
     NotificationPreferencesUpdated, ParticipantFilterModeChanged, RefundApprovalConsumed,
     RefundApprovalSet, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
     EVENT_VERSION_V2,
@@ -823,6 +824,12 @@ pub enum DataKey {
     NetworkId,
 
     MaintenanceMode, // bool flag
+    /// Timestamp when maintenance mode was last toggled.
+    MaintenanceModeUpdatedAt,
+    /// Admin that last toggled maintenance mode.
+    MaintenanceModeUpdatedBy,
+    /// Schema marker for maintenance mode hardening semantics.
+    MaintenanceModeSchemaVersion,
     /// Per-operation gas budget caps configured by the admin.
     /// See [`gas_budget::GasBudgetConfig`].
     GasBudgetConfig,
@@ -960,6 +967,7 @@ pub struct ReleaseApproval {
 }
 
 const REFUND_ELIGIBILITY_SCHEMA_VERSION_V1: u32 = 1;
+const MAINTENANCE_MODE_SCHEMA_VERSION_V1: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1184,6 +1192,20 @@ impl BountyEscrowContract {
             &DataKey::RefundEligibilitySchemaVersion,
             &REFUND_ELIGIBILITY_SCHEMA_VERSION_V1,
         );
+        // Upgrade-safe maintenance mode initialization (explicit key write).
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceMode, &false);
+        env.storage().instance().set(
+            &DataKey::MaintenanceModeSchemaVersion,
+            &MAINTENANCE_MODE_SCHEMA_VERSION_V1,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_bounty_initialized(
             &env,
@@ -1984,13 +2006,41 @@ impl BountyEscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        let previous_enabled = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceMode)
+            .unwrap_or(false);
+
+        // Idempotent behavior: if no state change, do not emit events.
+        if previous_enabled == enabled {
+            return Ok(());
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceMode, &enabled);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_maintenance_mode_changed(
             &env,
             events::MaintenanceModeChanged {
+                enabled,
+                reason,
+                admin: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        emit_maintenance_mode_changed_v2(
+            &env,
+            MaintenanceModeChangedV2 {
+                version: EVENT_VERSION_V2,
+                previous_enabled,
                 enabled,
                 reason,
                 admin: admin.clone(),
@@ -5490,151 +5540,6 @@ impl BountyEscrowContract {
             .get(&DataKey::Metadata(bounty_id));
 
         Ok(metadata.map(|m| m.risk_flags).unwrap_or(0))
-    }
-
-    // ============================================================================
-    // TWO-STEP ADMIN ROTATION WITH TIMELOCK
-    // ============================================================================
-
-    /// Represents a pending admin transfer.
-    #[contracttype]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct AdminTransferState {
-        pub proposed_admin: Address,
-        pub available_at: u64,
-    }
-
-    const DEFAULT_ADMIN_TIMELOCK: u64 = 86400; // 24 hours default
-
-    /// Configures the minimum delay required before an admin transfer can be accepted.
-    pub fn set_admin_timelock(env: Env, duration: u64) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        // Enforce a minimum timelock of 5 minutes to prevent instant hijack bypasses
-        if duration < 300 {
-            return Err(Error::InvalidAmount);
-        }
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("adm_tlock"), &duration);
-
-        events::emit_admin_timelock_configured(
-            &env,
-            events::AdminTimelockConfigured {
-                version: events::EVENT_VERSION_V2,
-                admin,
-                duration,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Step 1: Current admin proposes a new admin. Starts the timelock countdown.
-    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        let duration = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("adm_tlock"))
-            .unwrap_or(DEFAULT_ADMIN_TIMELOCK);
-            
-        let available_at = env.ledger().timestamp().saturating_add(duration);
-
-        let state = AdminTransferState {
-            proposed_admin: new_admin.clone(),
-            available_at,
-        };
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("adm_xfer"), &state);
-
-        events::emit_admin_transfer_proposed(
-            &env,
-            events::AdminTransferProposed {
-                version: events::EVENT_VERSION_V2,
-                old_admin: admin,
-                new_admin,
-                available_at,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Cancels an active admin transfer proposal.
-    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
-        let admin = rbac::require_admin(&env);
-        admin.require_auth();
-
-        if let Some(state) = env
-            .storage()
-            .instance()
-            .get::<_, AdminTransferState>(&symbol_short!("adm_xfer"))
-        {
-            env.storage().instance().remove(&symbol_short!("adm_xfer"));
-            events::emit_admin_transfer_cancelled(
-                &env,
-                events::AdminTransferCancelled {
-                    version: events::EVENT_VERSION_V2,
-                    old_admin: admin,
-                    proposed_admin: state.proposed_admin,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Step 2: Proposed admin accepts the role. Fails if the timelock has not expired.
-    pub fn accept_admin(env: Env) -> Result<(), Error> {
-        let state = env
-            .storage()
-            .instance()
-            .get::<_, AdminTransferState>(&symbol_short!("adm_xfer"))
-            .ok_or(Error::Unauthorized)?;
-
-        // The NEW admin must be the one to sign and accept
-        state.proposed_admin.require_auth();
-
-        if env.ledger().timestamp() < state.available_at {
-            return Err(Error::DeadlineNotPassed);
-        }
-
-        let old_admin = rbac::require_admin(&env);
-
-        // Execute the transfer and clean up state
-        env.storage().instance().set(&DataKey::Admin, &state.proposed_admin);
-        env.storage().instance().remove(&symbol_short!("adm_xfer"));
-
-        events::emit_admin_transfer_accepted(
-            &env,
-            events::AdminTransferAccepted {
-                version: events::EVENT_VERSION_V2,
-                old_admin,
-                new_admin: state.proposed_admin,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(())
-    }
-
-    /// View: Gets the current pending admin transfer details.
-    pub fn get_pending_admin(env: Env) -> Option<AdminTransferState> {
-        env.storage().instance().get(&symbol_short!("adm_xfer"))
-    }
-
-    /// View: Gets the current configured admin timelock duration.
-    pub fn get_admin_timelock(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("adm_tlock"))
-            .unwrap_or(DEFAULT_ADMIN_TIMELOCK)
     }
 }
 impl traits::EscrowInterface for BountyEscrowContract {
