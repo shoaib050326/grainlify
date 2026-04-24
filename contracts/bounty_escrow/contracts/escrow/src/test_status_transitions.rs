@@ -955,3 +955,169 @@ fn test_claim_window_expired_event_emitted_on_failure() {
     });
     assert!(found, "ClaimWindowExpired event not emitted");
 }
+
+
+// ============================================================================
+// BATCH SIZE CAPS TESTS
+// ============================================================================
+
+#[test]
+fn test_get_batch_size_caps_default() {
+    let setup = TestSetup::new();
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 20); // MAX_BATCH_SIZE
+    assert_eq!(caps.release_cap, 20);
+}
+
+#[test]
+fn test_set_batch_size_caps_success() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&10, &15);
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 10);
+    assert_eq!(caps.release_cap, 15);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_set_batch_size_caps_lock_cap_zero() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&0, &10);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_set_batch_size_caps_release_cap_zero() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&10, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_set_batch_size_caps_lock_cap_exceeds_max() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&21, &10);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_set_batch_size_caps_release_cap_exceeds_max() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&10, &21);
+}
+
+#[test]
+fn test_batch_lock_funds_respects_lock_cap() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&2, &20);
+    
+    let deadline = setup.env.ledger().timestamp() + 1000;
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    items.push_back(LockFundsItem {
+        bounty_id: 1,
+        depositor: setup.depositor.clone(),
+        amount: 1000,
+        deadline,
+    });
+    items.push_back(LockFundsItem {
+        bounty_id: 2,
+        depositor: setup.depositor.clone(),
+        amount: 1000,
+        deadline,
+    });
+    
+    let result = setup.escrow.batch_lock_funds(&items);
+    assert_eq!(result, 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_batch_lock_funds_exceeds_lock_cap() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&2, &20);
+    
+    let deadline = setup.env.ledger().timestamp() + 1000;
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    for i in 1..=3 {
+        items.push_back(LockFundsItem {
+            bounty_id: i,
+            depositor: setup.depositor.clone(),
+            amount: 1000,
+            deadline,
+        });
+    }
+    
+    setup.escrow.batch_lock_funds(&items);
+}
+
+#[test]
+fn test_batch_release_funds_respects_release_cap() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&20, &2);
+    
+    let deadline = setup.env.ledger().timestamp() + 1000;
+    setup.escrow.lock_funds(&setup.depositor, &1, &1000, &deadline);
+    setup.escrow.lock_funds(&setup.depositor, &2, &1000, &deadline);
+    
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    items.push_back(ReleaseFundsItem {
+        bounty_id: 1,
+        contributor: setup.contributor.clone(),
+    });
+    items.push_back(ReleaseFundsItem {
+        bounty_id: 2,
+        contributor: setup.contributor.clone(),
+    });
+    
+    let result = setup.escrow.batch_release_funds(&items);
+    assert_eq!(result, 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_batch_release_funds_exceeds_release_cap() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&20, &2);
+    
+    let deadline = setup.env.ledger().timestamp() + 1000;
+    for i in 1..=3 {
+        setup.escrow.lock_funds(&setup.depositor, &i, &1000, &deadline);
+    }
+    
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    for i in 1..=3 {
+        items.push_back(ReleaseFundsItem {
+            bounty_id: i,
+            contributor: setup.contributor.clone(),
+        });
+    }
+    
+    setup.escrow.batch_release_funds(&items);
+}
+
+#[test]
+fn test_batch_size_caps_independent() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&5, &10);
+    
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 5);
+    assert_eq!(caps.release_cap, 10);
+    
+    // Lock cap doesn't affect release cap
+    let deadline = setup.env.ledger().timestamp() + 1000;
+    for i in 1..=10 {
+        setup.escrow.lock_funds(&setup.depositor, &i, &1000, &deadline);
+    }
+    
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    for i in 1..=10 {
+        items.push_back(ReleaseFundsItem {
+            bounty_id: i,
+            contributor: setup.contributor.clone(),
+        });
+    }
+    
+    let result = setup.escrow.batch_release_funds(&items);
+    assert_eq!(result, 10);
+}

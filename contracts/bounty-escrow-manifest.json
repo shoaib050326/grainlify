@@ -3,7 +3,7 @@
   "contract_name": "BountyEscrowContract",
   "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.1.1",
+    "current": "2.4.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -54,6 +54,18 @@
           "Added InvalidBatchSizeCap error code for batch size governance",
           "Added BatchSizeCaps and FeeRoutingSchemaVersion DataKey variants for upgrade-safe storage",
           "Fee routing invariant is now enforced on-chain: last destination absorbs rounding remainder ensuring exact accounting"
+        ]
+      },
+      {
+        "version": "2.4.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Added set_batch_size_caps() admin function — configures per-operation lock_cap and release_cap with validation against MAX_BATCH_SIZE",
+          "Added get_batch_size_caps() view function — returns active caps, defaulting to MAX_BATCH_SIZE when not explicitly set",
+          "Added get_max_batch_size() and get_max_release_batch_size() private helpers — batch_lock_funds uses lock_cap, batch_release_funds uses release_cap",
+          "Fixed batch_release_funds to enforce release_cap instead of lock_cap",
+          "Wired BatchSizeCapsUpdated audit event into set_batch_size_caps with previous/new cap values, admin, and timestamp",
+          "Upgrade-safe: DataKey::BatchSizeCaps in instance storage; missing key falls back to compile-time MAX_BATCH_SIZE"
         ]
       }
     ]

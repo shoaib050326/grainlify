@@ -29,13 +29,14 @@ mod test_frozen_balance;
 mod test_reentrancy_guard;
 
 use crate::events::{
-    emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
+    emit_batch_funds_locked, emit_batch_funds_released, emit_batch_size_caps_updated,
+    emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
     emit_maintenance_mode_changed, emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_refund_approval_consumed, emit_refund_approval_set,
     emit_risk_flags_updated, emit_ticket_claimed, emit_ticket_issued, BatchFundsLocked,
-    BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
+    BatchFundsReleased, BatchSizeCapsUpdated, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
     CriticalOperationOutcome, DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked,
     FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged, MaintenanceModeChangedV2,
     NotificationPreferencesUpdated, ParticipantFilterModeChanged, RefundApprovalConsumed,
@@ -1419,6 +1420,59 @@ impl BountyEscrowContract {
             return Err(Error::InvalidBatchSize);
         }
         Ok(())
+    }
+
+    /// Returns the effective lock cap (used by `batch_lock_funds`).
+    fn get_max_batch_size(env: Env) -> u32 {
+        Self::get_batch_size_caps_internal(&env).lock_cap
+    }
+
+    /// Returns the effective release cap (used by `batch_release_funds`).
+    fn get_max_release_batch_size(env: &Env) -> u32 {
+        Self::get_batch_size_caps_internal(env).release_cap
+    }
+
+    /// Set per-operation batch size caps (admin only).
+    ///
+    /// Both `lock_cap` and `release_cap` must be in `1..=MAX_BATCH_SIZE`.
+    /// Emits [`BatchSizeCapsUpdated`] on success.
+    ///
+    /// # Upgrade safety
+    /// Caps are stored under `DataKey::BatchSizeCaps` in instance storage.
+    /// Contracts upgraded from a version without this key will read the
+    /// compile-time default (`MAX_BATCH_SIZE`) via `get_batch_size_caps_internal`.
+    pub fn set_batch_size_caps(env: Env, lock_cap: u32, release_cap: u32) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        let new_caps = BatchSizeCaps { lock_cap, release_cap };
+        Self::validate_batch_size_caps(&new_caps)?;
+
+        let previous = Self::get_batch_size_caps_internal(&env);
+        env.storage().instance().set(&DataKey::BatchSizeCaps, &new_caps);
+
+        emit_batch_size_caps_updated(
+            &env,
+            BatchSizeCapsUpdated {
+                version: EVENT_VERSION_V2,
+                previous_lock_cap: previous.lock_cap,
+                new_lock_cap: lock_cap,
+                previous_release_cap: previous.release_cap,
+                new_release_cap: release_cap,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the currently active batch size caps.
+    pub fn get_batch_size_caps(env: Env) -> BatchSizeCaps {
+        Self::get_batch_size_caps_internal(&env)
     }
 
     /// Validates treasury destinations before enabling multi-region routing.
@@ -5874,7 +5928,7 @@ impl BountyEscrowContract {
             if batch_size == 0 {
                 return Err(Error::InvalidBatchSize);
             }
-            let max_batch_size = Self::get_max_batch_size(env.clone());
+            let max_batch_size = Self::get_max_release_batch_size(&env);
             if batch_size as u32 > max_batch_size {
                 return Err(Error::InvalidBatchSize);
             }
