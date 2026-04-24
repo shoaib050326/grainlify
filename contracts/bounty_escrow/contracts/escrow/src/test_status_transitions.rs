@@ -955,3 +955,29 @@ fn test_claim_window_expired_event_emitted_on_failure() {
     });
     assert!(found, "ClaimWindowExpired event not emitted");
 }
+
+#[test]
+fn test_admin_transfer_flow() {
+    let env = Env::default();
+
+    let admin = Address::random(&env);
+    let new_admin = Address::random(&env);
+
+    set_admin(&env, &admin);
+
+    // propose
+    env.mock_all_auths();
+    propose_admin(env.clone(), new_admin.clone());
+
+    // before timelock → fail
+    assert_panics(|| accept_admin(env.clone()));
+
+    // move time forward
+    env.ledger().with_mut(|l| l.timestamp += ADMIN_TIMELOCK + 1);
+
+    // accept
+    env.mock_all_auths();
+    accept_admin(env.clone());
+
+    assert_eq!(get_admin(&env), new_admin);
+}
