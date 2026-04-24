@@ -3,7 +3,7 @@
   "contract_name": "GrainlifyContract",
   "contract_purpose": "Provides secure contract upgrade mechanism with version tracking, migration support, multisig governance, and comprehensive monitoring capabilities",
   "version": {
-    "current": "2.0.0",
+    "current": "3.0.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -25,6 +25,21 @@
           "Comprehensive monitoring and analytics",
           "Improved version management with semantic versioning",
           "Added rollback support"
+        ]
+      },
+      {
+        "version": "3.0.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Added timelocked upgrade execution (DEFAULT_TIMELOCK_DELAY=86400s, MIN=3600s, MAX=2592000s)",
+          "Added emergency pause/unpause via multisig (pause, unpause, is_paused)",
+          "Added commit_migration for replay-protected migration pre-authorization",
+          "Added cancel_upgrade for explicit proposal revocation",
+          "Added get_upgrade_proposal for proposal introspection",
+          "Added init_with_network for network-aware initialization",
+          "Added init_governance for governance-based initialization",
+          "Timelock starts automatically when multisig threshold is met",
+          "Paused contract blocks propose_upgrade and approve_upgrade"
         ]
       }
     ]
@@ -92,30 +107,35 @@
       },
       {
         "name": "propose_upgrade",
-        "description": "Propose an upgrade with multisig approval",
+        "description": "Propose a WASM upgrade via multisig. Returns the stable proposal ID. Blocked when contract is paused.",
         "parameters": [
           {
             "name": "proposer",
             "type": "Address",
-            "description": "Address proposing the upgrade"
+            "description": "Address proposing the upgrade (must be a registered multisig signer)"
           },
           {
             "name": "wasm_hash",
             "type": "BytesN<32>",
-            "description": "Hash of the new WASM code"
+            "description": "Hash of the new WASM code to install"
+          },
+          {
+            "name": "expiry",
+            "type": "u64",
+            "description": "Ledger timestamp after which proposal expires (0 = no expiry)"
           }
         ],
         "returns": {
           "type": "u64",
-          "description": "Proposal ID"
+          "description": "Stable proposal ID for subsequent approve/cancel/execute calls"
         },
         "authorization": "signer",
-        "pausable": false,
+        "pausable": true,
         "gas_estimate": "medium"
       },
       {
         "name": "approve_upgrade",
-        "description": "Approve an upgrade proposal",
+        "description": "Approve a pending upgrade proposal. Automatically starts the timelock when the multisig threshold is met. Blocked when contract is paused.",
         "parameters": [
           {
             "name": "proposal_id",
@@ -125,7 +145,30 @@
           {
             "name": "signer",
             "type": "Address",
-            "description": "Address approving the proposal"
+            "description": "Signer address approving the proposal"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "signer",
+        "pausable": true,
+        "gas_estimate": "medium"
+      },
+      {
+        "name": "cancel_upgrade",
+        "description": "Cancel a pending upgrade proposal. Any registered multisig signer may cancel. Clears the associated timelock.",
+        "parameters": [
+          {
+            "name": "proposal_id",
+            "type": "u64",
+            "description": "Proposal ID to cancel"
+          },
+          {
+            "name": "canceller",
+            "type": "Address",
+            "description": "Signer address cancelling the proposal"
           }
         ],
         "returns": {
@@ -134,11 +177,11 @@
         },
         "authorization": "signer",
         "pausable": false,
-        "gas_estimate": "medium"
+        "gas_estimate": "low"
       },
       {
         "name": "execute_upgrade",
-        "description": "Execute an approved upgrade proposal",
+        "description": "Execute an approved upgrade proposal after the timelock delay has elapsed. Panics if timelock has not started or delay has not passed.",
         "parameters": [
           {
             "name": "proposal_id",
@@ -153,6 +196,65 @@
         "authorization": "multisig",
         "pausable": false,
         "gas_estimate": "high"
+      },
+      {
+        "name": "pause",
+        "description": "Emergency pause: blocks propose_upgrade and approve_upgrade. Any registered multisig signer may pause.",
+        "parameters": [
+          {
+            "name": "signer",
+            "type": "Address",
+            "description": "Signer address triggering the pause"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "signer",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "unpause",
+        "description": "Resume normal operation after emergency pause. Any registered multisig signer may unpause.",
+        "parameters": [
+          {
+            "name": "signer",
+            "type": "Address",
+            "description": "Signer address lifting the pause"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "signer",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "commit_migration",
+        "description": "Pre-authorize a migration hash for replay protection. Must be called before migrate() with the same target_version and hash.",
+        "parameters": [
+          {
+            "name": "target_version",
+            "type": "u32",
+            "description": "Target version this commitment authorizes"
+          },
+          {
+            "name": "hash",
+            "type": "BytesN<32>",
+            "description": "Hash to commit — must match hash passed to migrate()"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ],
     "view": [
@@ -381,6 +483,22 @@
         "description": "List of authorized multisig signers",
         "constraints": "non-empty list",
         "admin_only": true
+      },
+      {
+        "name": "timelock_delay",
+        "type": "u64",
+        "default_value": "86400",
+        "description": "Seconds to wait after threshold is met before execute_upgrade is allowed",
+        "constraints": "3600 <= value <= 2592000 (1 hour to 30 days)",
+        "admin_only": true
+      },
+      {
+        "name": "paused",
+        "type": "bool",
+        "default_value": "false",
+        "description": "Emergency pause flag; blocks propose_upgrade and approve_upgrade when true",
+        "constraints": "toggled by any registered multisig signer",
+        "admin_only": false
       }
     ],
     "storage_keys": [
@@ -397,22 +515,46 @@
         "data_structure": "u32"
       },
       {
-        "name": "UpgradeProposal",
+        "name": "UpgradeProposal(u64)",
         "type": "instance",
-        "description": "Upgrade proposals by ID",
+        "description": "WASM hash stored per upgrade proposal ID",
         "data_structure": "BytesN<32>"
+      },
+      {
+        "name": "UpgradeTimelock(u64)",
+        "type": "instance",
+        "description": "Ledger timestamp when timelock started for a given proposal ID",
+        "data_structure": "u64"
+      },
+      {
+        "name": "TimelockDelay",
+        "type": "instance",
+        "description": "Configured timelock delay in seconds (default 86400)",
+        "data_structure": "u64"
       },
       {
         "name": "MigrationState",
         "type": "instance",
-        "description": "Migration state tracking",
+        "description": "Migration state tracking (from/to version, hash, timestamp)",
         "data_structure": "MigrationState"
+      },
+      {
+        "name": "MigrationCommitment(u32)",
+        "type": "instance",
+        "description": "Pre-committed migration hash keyed by target_version; consumed after migrate()",
+        "data_structure": "MigrationCommitment"
       },
       {
         "name": "PreviousVersion",
         "type": "instance",
         "description": "Previous version before migration",
         "data_structure": "u32"
+      },
+      {
+        "name": "ReadOnlyMode",
+        "type": "instance",
+        "description": "Read-only mode flag; blocks all mutations when true",
+        "data_structure": "bool"
       }
     ]
   },
@@ -420,8 +562,18 @@
     "security_features": [
       "Immutable admin after initialization",
       "Multisig support for critical operations",
+      "Timelocked upgrade execution (default 24h, min 1h, max 30d)",
+      "Emergency pause/unpause via any multisig signer",
+      "Timelock starts automatically when multisig threshold is met",
+      "Paused contract blocks new upgrade proposals and approvals",
+      "Commit-reveal replay protection for migrations",
+      "Migration commitment consumed after use (no replay)",
       "Version tracking and audit trail",
       "State migration with rollback support",
+      "Read-only mode blocks all mutations during incidents",
+      "Two-step admin restore for snapshot-based admin changes",
+      "Proposal expiry prevents stale approvals",
+      "Explicit proposal cancellation by any signer",
       "Comprehensive monitoring and analytics",
       "Performance tracking",
       "Health check capabilities",
@@ -446,9 +598,29 @@
         "mitigation": "Choose admin carefully, use multisig for additional security"
       },
       {
+        "behavior": "Timelocked upgrade execution",
+        "impact": "Approved upgrades cannot execute until the timelock delay elapses (default 24h)",
+        "mitigation": "Monitor timelock status; cancel proposal if upgrade is no longer desired"
+      },
+      {
+        "behavior": "Timelock auto-start on threshold",
+        "impact": "Timelock begins automatically when the last required approval is recorded",
+        "mitigation": "Signers should coordinate timing; use expiry to bound proposal lifetime"
+      },
+      {
+        "behavior": "Emergency pause blocks new proposals",
+        "impact": "When paused, propose_upgrade and approve_upgrade revert; execute_upgrade is unaffected",
+        "mitigation": "Unpause via any registered multisig signer once the incident is resolved"
+      },
+      {
+        "behavior": "Commit-reveal migration replay protection",
+        "impact": "migrate() requires a prior commit_migration() call with the same hash; commitment is consumed on use",
+        "mitigation": "Always call commit_migration before migrate; store commitment hash securely"
+      },
+      {
         "behavior": "WASM upgrade",
         "impact": "Contract code can be completely replaced",
-        "mitigation": "Require admin authorization and optionally multisig approval"
+        "mitigation": "Require admin authorization and optionally multisig approval with timelock"
       },
       {
         "behavior": "State preservation",
@@ -517,58 +689,76 @@
     ],
     "events": [
       {
-        "name": "ContractUpgraded",
-        "description": "Contract successfully upgraded",
+        "name": "upgrade/wasm",
+        "description": "Contract WASM successfully upgraded",
         "data": [
-          {
-            "name": "old_version",
-            "type": "u32",
-            "description": "Previous version"
-          },
-          {
-            "name": "new_version",
-            "type": "u32",
-            "description": "New version"
-          },
-          {
-            "name": "wasm_hash",
-            "type": "BytesN<32>",
-            "description": "New WASM hash"
-          },
-          {
-            "name": "timestamp",
-            "type": "u64",
-            "description": "Upgrade timestamp"
-          }
+          {"name": "new_wasm_hash", "type": "BytesN<32>", "description": "New WASM hash installed"},
+          {"name": "previous_version", "type": "u32", "description": "Version before upgrade"},
+          {"name": "timestamp", "type": "u64", "description": "Upgrade timestamp"}
         ],
-        "trigger": "Successful upgrade operation"
+        "trigger": "Successful upgrade() or execute_upgrade()"
       },
       {
-        "name": "MigrationCompleted",
+        "name": "timelock/started",
+        "description": "Timelock started after multisig threshold was met",
+        "data": [
+          {"name": "proposal_id", "type": "u64", "description": "Proposal that triggered the timelock"},
+          {"name": "timestamp", "type": "u64", "description": "Ledger timestamp when timelock started"}
+        ],
+        "trigger": "approve_upgrade() when threshold is first met"
+      },
+      {
+        "name": "timelock/dly_chg",
+        "description": "Timelock delay configuration changed",
+        "data": [
+          {"name": "old_delay", "type": "u64", "description": "Previous delay in seconds"},
+          {"name": "new_delay", "type": "u64", "description": "New delay in seconds"}
+        ],
+        "trigger": "set_timelock_delay()"
+      },
+      {
+        "name": "paused",
+        "description": "Contract emergency pause activated",
+        "data": [
+          {"name": "signer", "type": "Address", "description": "Signer who triggered the pause"}
+        ],
+        "trigger": "pause()"
+      },
+      {
+        "name": "unpause",
+        "description": "Contract emergency pause lifted",
+        "data": [
+          {"name": "signer", "type": "Address", "description": "Signer who lifted the pause"}
+        ],
+        "trigger": "unpause()"
+      },
+      {
+        "name": "migrate/commit",
+        "description": "Migration hash pre-committed",
+        "data": [
+          {"name": "target_version", "type": "u32", "description": "Target version authorized"},
+          {"name": "timestamp", "type": "u64", "description": "Commitment timestamp"}
+        ],
+        "trigger": "commit_migration()"
+      },
+      {
+        "name": "migrate/done",
         "description": "State migration completed",
         "data": [
-          {
-            "name": "from_version",
-            "type": "u32",
-            "description": "Source version"
-          },
-          {
-            "name": "to_version",
-            "type": "u32",
-            "description": "Target version"
-          },
-          {
-            "name": "migration_hash",
-            "type": "BytesN<32>",
-            "description": "Migration data hash"
-          },
-          {
-            "name": "timestamp",
-            "type": "u64",
-            "description": "Migration timestamp"
-          }
+          {"name": "from_version", "type": "u32", "description": "Source version"},
+          {"name": "to_version", "type": "u32", "description": "Target version"},
+          {"name": "timestamp", "type": "u64", "description": "Migration timestamp"}
         ],
-        "trigger": "Successful migration"
+        "trigger": "migrate()"
+      },
+      {
+        "name": "cancelled",
+        "description": "Upgrade proposal cancelled",
+        "data": [
+          {"name": "proposal_id", "type": "u64", "description": "Cancelled proposal ID"},
+          {"name": "canceller", "type": "Address", "description": "Signer who cancelled"}
+        ],
+        "trigger": "cancel_upgrade()"
       }
     ]
   },
@@ -669,25 +859,52 @@
   },
   "testing": {
     "test_coverage": {
-      "unit_tests": "90%",
-      "integration_tests": "85%",
+      "unit_tests": "95%",
+      "integration_tests": "90%",
       "test_files": [
-        "test_core_monitoring.rs",
-        "upgrade_rollback_tests.rs",
-        "migration_hook_tests.rs"
+        "src/test/upgrade_timelock_tests.rs",
+        "src/test/upgrade_rollback_tests.rs",
+        "src/test/e2e_upgrade_migration_tests.rs",
+        "src/test/state_snapshot_tests.rs",
+        "src/test/invariant_entrypoints_tests.rs",
+        "src/test/upgrade_rollback_scenarios.rs",
+        "src/test/nonce_tests.rs",
+        "src/test_timelocked_pause.rs",
+        "src/test_core_monitoring.rs",
+        "src/test_strict_mode.rs",
+        "src/test_storage_layout.rs"
       ]
     },
     "test_scenarios": [
-      "Contract initialization (single admin and multisig)",
-      "WASM upgrade process",
-      "Version management",
-      "State migration",
-      "Multisig proposal and approval workflow",
-      "Rollback procedures",
-      "Error handling for unauthorized access",
-      "Health check functionality",
-      "Analytics and monitoring",
-      "Performance tracking"
+      "Contract initialization (single admin, multisig, governance, network-aware)",
+      "WASM upgrade process (single admin and multisig paths)",
+      "Timelock default delay (86400s)",
+      "Timelock minimum enforcement (3600s)",
+      "Timelock maximum enforcement (2592000s)",
+      "Timelock auto-start when threshold is met",
+      "Timelock prevents immediate execution",
+      "Timelock allows execution after delay elapses",
+      "Timelock boundary conditions (1s before/after)",
+      "Timelock countdown and status queries",
+      "Emergency pause blocks propose_upgrade",
+      "Emergency pause blocks approve_upgrade",
+      "Emergency pause does NOT block execute_upgrade",
+      "Unpause restores normal operation",
+      "Pause/unpause requires registered signer",
+      "Non-signer cannot pause or unpause",
+      "Commit-reveal migration replay protection",
+      "Migration commitment consumed after use",
+      "Migration idempotency (same version twice is no-op)",
+      "Migration hash mismatch rejection",
+      "Missing commitment rejection",
+      "Proposal cancellation by any signer",
+      "Cancelled proposal cannot be approved or executed",
+      "Proposal expiry enforcement",
+      "Double-approval rejection",
+      "Non-signer rejection on proposal/approval",
+      "Read-only mode blocks set_timelock_delay",
+      "Version management and rollback support",
+      "Health check and invariant verification"
     ]
   },
   "documentation": {
