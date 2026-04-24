@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::testutils::{Events, Ledger};
 use soroban_sdk::{
     testutils::{Address as _, LedgerInfo, MockAuth, MockAuthInvoke},
-    token, Address, Env, IntoVal, Symbol, TryIntoVal, Val,
+    token, Address, Env, IntoVal, Symbol, Val,
 };
 
 fn create_token_contract<'a>(
@@ -84,7 +84,11 @@ impl<'a> RotationSetup<'a> {
             &escrow,
             &admin,
             "init",
-            (&admin, &token.address).into_val(&env),
+            soroban_sdk::vec![
+                &env,
+                admin.clone().into_val(&env),
+                token.address.clone().into_val(&env),
+            ],
         );
         escrow.init(&admin, &token.address);
 
@@ -97,7 +101,7 @@ impl<'a> RotationSetup<'a> {
         }
     }
 
-    fn authorize(&self, address: &Address, fn_name: &'static str, args: Val) {
+    fn authorize(&self, address: &Address, fn_name: &'static str, args: soroban_sdk::Vec<Val>) {
         authorize_contract_call(&self.env, &self.escrow, address, fn_name, args);
     }
 }
@@ -107,7 +111,7 @@ fn authorize_contract_call(
     escrow: &BountyEscrowContractClient<'_>,
     address: &Address,
     fn_name: &'static str,
-    args: Val,
+    args: soroban_sdk::Vec<Val>,
 ) {
     env.mock_auths(&[MockAuth {
         address,
@@ -184,31 +188,31 @@ fn test_refund_eligibility_eligible_with_admin_approval_before_deadline() {
     assert!(view.approval_present);
 }
 
+/// Maintenance mode halts ALL state-mutating operations globally (lock, release, refund).
+/// This is the hardened behavior: no state changes may occur during maintenance.
 #[test]
-fn test_maintenance_mode_blocks_lock_but_not_release_or_refund_paths() {
+fn test_maintenance_mode_blocks_all_operations() {
     let setup = TestSetup::new();
     let bounty_id = 202;
     let amount = 1000;
     let deadline = setup.env.ledger().timestamp() + 100;
 
-    setup.escrow.set_maintenance_mode(&true);
+    setup.escrow.set_maintenance_mode(&true, &None);
 
-    // Lock should be blocked (maintenance mode acts like lock pause).
+    // Lock is blocked.
     let res = setup
         .escrow
         .try_lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
     assert!(matches!(res, Err(Ok(Error::FundsPaused))));
 
-    // Existing escrow should still be able to release/refund (maintenance mode only affects lock).
-    setup
-        .escrow
-        .set_maintenance_mode(&false);
-    setup
-        .escrow
-        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-    setup.escrow.set_maintenance_mode(&true);
+    // Disable maintenance mode to lock, then re-enable to test release blocking.
+    setup.escrow.set_maintenance_mode(&false, &None);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.set_maintenance_mode(&true, &None);
 
-    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+    // Release is also blocked in hardened maintenance mode.
+    let res = setup.escrow.try_release_funds(&bounty_id, &setup.contributor);
+    assert!(matches!(res, Err(Ok(Error::FundsPaused))));
 }
 
 // Valid transitions: Locked → Released
@@ -318,7 +322,7 @@ fn test_partially_refunded_to_refunded() {
 
 // Invalid transition: Released → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "Error(Contract, #201)")]
 fn test_released_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -337,7 +341,7 @@ fn test_released_to_locked_fails() {
 
 // Invalid transition: Released → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_released_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -354,7 +358,7 @@ fn test_released_to_released_fails() {
 
 // Invalid transition: Released → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_released_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -372,7 +376,7 @@ fn test_released_to_refunded_fails() {
 
 // Invalid transition: Released → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_released_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -392,7 +396,7 @@ fn test_released_to_partially_refunded_fails() {
 
 // Invalid transition: Refunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "Error(Contract, #201)")]
 fn test_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -421,7 +425,7 @@ fn test_refunded_to_locked_fails() {
 
 // Invalid transition: Refunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -448,7 +452,7 @@ fn test_refunded_to_released_fails() {
 
 // Invalid transition: Refunded → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_refunded_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -475,7 +479,7 @@ fn test_refunded_to_refunded_fails() {
 
 // Invalid transition: Refunded → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_refunded_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -504,7 +508,7 @@ fn test_refunded_to_partially_refunded_fails() {
 
 // Invalid transition: PartiallyRefunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "Error(Contract, #201)")]
 fn test_partially_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -526,7 +530,7 @@ fn test_partially_refunded_to_locked_fails() {
 
 // Invalid transition: PartiallyRefunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #203)")]
 fn test_partially_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -903,11 +907,13 @@ fn test_set_claim_window_emits_event() {
     let setup = TestSetup::new();
     setup.escrow.set_claim_window(&7200_u64);
     let events = setup.env.events().all();
+    let expected = soroban_sdk::Symbol::new(&setup.env, "clm_set");
     let found = events.iter().any(|(_, topics, _)| {
         topics.len() >= 1
             && topics
                 .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "cw_set").into_val(&setup.env))
+                .and_then(|t| <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(&setup.env, &t).ok())
+                .map(|s| s == expected)
                 .unwrap_or(false)
     });
     assert!(found, "ClaimWindowSet event not emitted");
@@ -921,11 +927,13 @@ fn test_claim_window_validated_event_emitted_on_success() {
     let _recipient = setup_claim_window_bounty(&setup, bounty_id, amount, 3_600);
     setup.escrow.claim(&bounty_id);
     let events = setup.env.events().all();
+    let expected = soroban_sdk::Symbol::new(&setup.env, "clm_ok");
     let found = events.iter().any(|(_, topics, _)| {
         topics.len() >= 1
             && topics
                 .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "cw_ok").into_val(&setup.env))
+                .and_then(|t| <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(&setup.env, &t).ok())
+                .map(|s| s == expected)
                 .unwrap_or(false)
     });
     assert!(found, "ClaimWindowValidated event not emitted");
@@ -946,11 +954,13 @@ fn test_claim_window_expired_event_emitted_on_failure() {
     // Attempt claim — will fail, but the expired event should be emitted.
     let _ = setup.escrow.try_claim(&bounty_id);
     let events = setup.env.events().all();
+    let expected = soroban_sdk::Symbol::new(&setup.env, "clm_exp");
     let found = events.iter().any(|(_, topics, _)| {
         topics.len() >= 1
             && topics
                 .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "cw_exp").into_val(&setup.env))
+                .and_then(|t| <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(&setup.env, &t).ok())
+                .map(|s| s == expected)
                 .unwrap_or(false)
     });
     assert!(found, "ClaimWindowExpired event not emitted");

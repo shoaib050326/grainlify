@@ -874,8 +874,6 @@ pub struct MaintenanceModeChanged {
     pub enabled: bool,
     pub reason: Option<soroban_sdk::String>,
     pub admin: Address,
-    /// Optional reason provided by the admin for enabling/disabling maintenance.
-    pub reason: Option<soroban_sdk::String>,
     pub timestamp: u64,
 }
 
@@ -1767,3 +1765,120 @@ pub fn emit_fee_routing_schema_version_set(env: &Env, event: FeeRoutingSchemaVer
     let topics = (symbol_short!("fee_schm"),);
     env.events().publish(topics, event);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLAIM WINDOW EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when the admin configures the global claim-window duration via
+/// [`BountyEscrowContract::set_claim_window`].
+///
+/// ### Topics
+/// `("clm_set",)`
+///
+/// ### Security notes
+/// - Setting `claim_window` to `0` disables window enforcement entirely.
+/// - Emitted after the value is persisted so the event reflects settled state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowSet {
+    pub version: u32,
+    /// Configured window duration in seconds (0 = disabled).
+    pub claim_window: u64,
+    /// Admin that made the change.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emit [`ClaimWindowSet`].
+pub fn emit_claim_window_set(env: &Env, event: ClaimWindowSet) {
+    let topics = (symbol_short!("clm_set"),);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a pending claim's window is validated successfully (still open).
+///
+/// ### Topics
+/// `("clm_ok", bounty_id)`
+///
+/// ### Security notes
+/// - Emitted only when a `PendingClaim` exists AND `now <= expires_at`.
+/// - A missing event for a release call means the window was skipped (no claim
+///   record) or the window was disabled (`claim_window == 0`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowValidated {
+    pub version: u32,
+    pub bounty_id: u64,
+    /// Current ledger timestamp at the time of validation.
+    pub now: u64,
+    /// Expiry timestamp of the claim window.
+    pub expires_at: u64,
+}
+
+/// Emit [`ClaimWindowValidated`].
+pub fn emit_claim_window_validated(env: &Env, event: ClaimWindowValidated) {
+    let topics = (symbol_short!("clm_ok"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a pending claim's window has expired (`now > expires_at`).
+///
+/// ### Topics
+/// `("clm_exp", bounty_id)`
+///
+/// ### Security notes
+/// - Emitted before the error is returned so the rejection is always visible
+///   on-chain even if the surrounding call reverts for a different reason.
+/// - The `now` and `expires_at` fields let auditors verify the expiry was
+///   correct without re-reading historical ledger state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowExpired {
+    pub version: u32,
+    pub bounty_id: u64,
+    /// Current ledger timestamp that exceeded the window.
+    pub now: u64,
+    /// The window expiry that was exceeded.
+    pub expires_at: u64,
+}
+
+/// Emit [`ClaimWindowExpired`].
+pub fn emit_claim_window_expired(env: &Env, event: ClaimWindowExpired) {
+    let topics = (symbol_short!("clm_exp"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAINTENANCE MODE SCHEMA VERSION EVENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Emitted once during `init()` to record the maintenance mode storage schema version.
+///
+/// Enables upgrade safety checks to detect schema mismatches when the
+/// maintenance mode storage layout changes.
+///
+/// ### Topics
+/// `("maint_v",)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceModeSchemaVersionSet {
+    pub version: u32,
+    /// Schema version written to instance storage.
+    pub schema_version: u32,
+    /// Admin that initialized the contract.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emit [`MaintenanceModeSchemaVersionSet`].
+pub fn emit_maintenance_mode_schema_version_set(
+    env: &Env,
+    event: MaintenanceModeSchemaVersionSet,
+) {
+    let topics = (symbol_short!("maint_v"),);
+    env.events().publish(topics, event);
+}
+
