@@ -965,3 +965,58 @@ fn test_claim_window_expired_event_emitted_on_failure() {
     });
     assert!(found, "ClaimWindowExpired event not emitted");
 }
+
+// ============================================================
+// MM (Maintenance Mode) — targeted tests for task #1007
+// ============================================================
+
+/// MM-06: MaintenanceModeSchemaVersion is written to instance storage during init
+/// with value MAINTENANCE_MODE_SCHEMA_VERSION_V1 (= 1).
+#[test]
+fn test_maintenance_schema_version_written_on_init() {
+    let setup = TestSetup::new();
+    let version = setup.escrow.get_maintenance_schema_version();
+    assert_eq!(version, 1, "schema version must be 1 after init");
+}
+
+/// MM-07: MaintenanceModeChangedV2 event is emitted on every set_maintenance_mode call.
+/// Verifies via event count and state changes, keeping topic parsing opt-in with safe try-convert.
+#[test]
+fn test_maintenance_mode_v2_event_emitted_on_enable_and_disable() {
+    use soroban_sdk::testutils::Events;
+    let setup = TestSetup::new();
+
+    // Enable maintenance mode and count events.
+    let count_before = setup.env.events().all().len();
+    setup.escrow.set_maintenance_mode(&true, &None);
+    let count_after_enable = setup.env.events().all().len();
+    assert!(
+        count_after_enable > count_before,
+        "at least one event must be emitted on enable"
+    );
+
+    // The v2 topic pair ("maint", "v2") must appear — use try_from_val to avoid panics
+    // on topic Vals that are not Symbols.
+    let events_enable = setup.env.events().all();
+    let has_v2 = events_enable.iter().any(|e| {
+        let t0 = e.1.get(0).and_then(|v| {
+            <Symbol as soroban_sdk::TryFromVal<Env, Val>>::try_from_val(&setup.env, &v).ok()
+        });
+        let t1 = e.1.get(1).and_then(|v| {
+            <Symbol as soroban_sdk::TryFromVal<Env, Val>>::try_from_val(&setup.env, &v).ok()
+        });
+        t0.as_ref().map(|s| s == &Symbol::new(&setup.env, "maint")).unwrap_or(false)
+            && t1.as_ref().map(|s| s == &Symbol::new(&setup.env, "v2")).unwrap_or(false)
+    });
+    assert!(has_v2, "MaintenanceModeChangedV2 (topics maint+v2) must be emitted on enable");
+    assert!(setup.escrow.is_maintenance_mode(), "maintenance mode must be active after enable");
+
+    // Disable maintenance mode — another v2 event must be emitted.
+    let count_before_disable = setup.env.events().all().len();
+    setup.escrow.set_maintenance_mode(&false, &None);
+    assert!(
+        setup.env.events().all().len() > count_before_disable,
+        "at least one event must be emitted on disable"
+    );
+    assert!(!setup.escrow.is_maintenance_mode(), "maintenance mode must be inactive after disable");
+}

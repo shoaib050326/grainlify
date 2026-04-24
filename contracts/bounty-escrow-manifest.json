@@ -3,7 +3,7 @@
   "contract_name": "BountyEscrowContract",
   "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.1.1",
+    "current": "2.4.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -54,6 +54,17 @@
           "Added InvalidBatchSizeCap error code for batch size governance",
           "Added BatchSizeCaps and FeeRoutingSchemaVersion DataKey variants for upgrade-safe storage",
           "Fee routing invariant is now enforced on-chain: last destination absorbs rounding remainder ensuring exact accounting"
+        ]
+      },
+      {
+        "version": "2.4.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Hardened check_paused(): maintenance mode is now checked first and blocks ALL operations (lock, release, refund) globally before any per-operation flag is evaluated",
+          "Added MaintenanceModeSchemaVersion DataKey — upgrade-safe storage marker written at init",
+          "Added emit_maintenance_mode_changed_v2 with previous_enabled, reason, and version: 2 fields for complete state-transition audit trail",
+          "Added ClaimWindowSet, ClaimWindowValidated, ClaimWindowExpired events with topics clm_set, clm_ok, clm_exp",
+          "Added 5 targeted tests in test_status_transitions.rs: blocks_all_operations, halts_lock, halts_release, halts_refund, toggles_correctly"
         ]
       }
     ]

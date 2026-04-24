@@ -2454,6 +2454,13 @@ impl ProgramEscrowContract {
             .unwrap_or(0)
     }
 
+    pub fn get_schedule_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ScheduleSchemaVersion)
+            .unwrap_or(0)
+    }
+
     /// Check if an operation is paused
     fn check_paused(env: &Env, operation: Symbol) -> bool {
         if Self::is_maintenance_mode(env.clone()) && operation == symbol_short!("lock") {

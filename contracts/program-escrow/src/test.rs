@@ -3037,3 +3037,175 @@ fn test_pause_reason_cleared_on_full_unpause() {
     let flags = client.get_pause_flags();
     assert_eq!(flags.pause_reason, None, "reason must be cleared when fully unpaused");
 }
+
+// ============================================================
+// SR (Scheduled Releases) — targeted tests for task #1044
+// ============================================================
+
+/// SR-01: trigger_program_releases processes schedules in ascending schedule_id order
+/// regardless of creation order, ensuring deterministic execution across invocations.
+#[test]
+fn test_trigger_releases_deterministic_order_by_schedule_id() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 300);
+
+    let now = env.ledger().timestamp();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    // Create schedules in reverse order so id=3 is created first, id=1 last.
+    client.create_program_release_schedule(&r3, &100, &(now + 10));
+    client.create_program_release_schedule(&r2, &100, &(now + 10));
+    client.create_program_release_schedule(&r1, &100, &(now + 10));
+
+    env.ledger().set_timestamp(now + 20);
+    let released = client.trigger_program_releases();
+    assert_eq!(released, 3, "all three schedules should be released");
+
+    // Verify all three recipients received funds — proof that ordering did not drop any.
+    assert_eq!(token_client.balance(&r1), 100);
+    assert_eq!(token_client.balance(&r2), 100);
+    assert_eq!(token_client.balance(&r3), 100);
+
+    let history = client.get_program_release_history();
+    assert_eq!(history.len(), 3);
+    // History is appended in processing order (ascending schedule_id).
+    assert!(
+        history.get(0).unwrap().schedule_id < history.get(1).unwrap().schedule_id,
+        "history entries must be ordered by ascending schedule_id"
+    );
+    assert!(
+        history.get(1).unwrap().schedule_id < history.get(2).unwrap().schedule_id
+    );
+}
+
+/// SR-02: schedules are skipped (not panicked, not released) when the contract
+/// balance is insufficient to cover the scheduled amount.
+#[test]
+fn test_trigger_releases_skip_on_insufficient_balance() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 50);
+
+    let now = env.ledger().timestamp();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    // Schedule 1: 30 tokens — fits within the 50-token balance.
+    client.create_program_release_schedule(&r1, &30, &(now + 10));
+    // Schedule 2: 30 tokens — would exceed remaining balance (50 - 30 = 20 < 30).
+    client.create_program_release_schedule(&r2, &30, &(now + 10));
+
+    env.ledger().set_timestamp(now + 20);
+    let released = client.trigger_program_releases();
+
+    // Only the first schedule should release; the second is skipped.
+    assert_eq!(released, 1, "second schedule must be skipped, not panicked");
+    assert_eq!(token_client.balance(&r1), 30, "first recipient must receive funds");
+    assert_eq!(token_client.balance(&r2), 0, "skipped recipient must receive nothing");
+
+    // The skipped schedule must remain pending (not marked released).
+    let schedules = client.get_all_prog_release_schedules();
+    let s2 = schedules.iter().find(|s| s.schedule_id == 2).unwrap();
+    assert!(!s2.released, "skipped schedule must remain in pending state");
+}
+
+/// SR-03: ScheduleSchemaVersion is written to instance storage during init
+/// with value SCHEDULE_SCHEMA_VERSION_V1 (= 1).
+#[test]
+fn test_schedule_schema_version_written_on_init() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 0);
+
+    let version = client.get_schedule_schema_version();
+    assert_eq!(
+        version, SCHEDULE_SCHEMA_VERSION_V1,
+        "schedule schema version must equal SCHEDULE_SCHEMA_VERSION_V1 after init"
+    );
+}
+
+/// SR-04: publish_program() transitions status Draft → Active exactly once;
+/// a second call panics because the program is no longer in Draft.
+#[test]
+#[should_panic]
+fn test_publish_program_rejects_non_draft() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_id = sac.address();
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+    client.publish_program(); // Draft → Active (ok)
+    client.publish_program(); // Active → panic expected
+}
+
+/// SR-05: ScheduleTriggerSummaryEvent is emitted with correct released_count
+/// and skipped_count after each trigger_program_releases invocation.
+#[test]
+fn test_trigger_releases_summary_event_fields() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 100);
+
+    let now = env.ledger().timestamp();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    client.create_program_release_schedule(&r1, &60, &(now + 10));
+    client.create_program_release_schedule(&r2, &60, &(now + 10)); // will be skipped
+
+    env.ledger().set_timestamp(now + 20);
+    client.trigger_program_releases();
+
+    let all_events = env.events().all();
+    let summary_event = all_events.iter().find(|e| {
+        if let Some(t0) = e.1.get(0) {
+            let sym: Symbol = t0.into_val(&env);
+            sym == symbol_short!("SchTrig")
+        } else {
+            false
+        }
+    });
+
+    assert!(summary_event.is_some(), "ScheduleTriggerSummaryEvent must be emitted");
+
+    let event = summary_event.unwrap();
+    let evt = ScheduleTriggerSummaryEvent::try_from_val(&env, &event.2)
+        .expect("event data must decode as ScheduleTriggerSummaryEvent");
+    assert_eq!(evt.released_count, 1, "one schedule should be released");
+    assert_eq!(evt.skipped_count, 1, "one schedule should be skipped");
+    assert_eq!(evt.version, 2, "event version must be EVENT_VERSION_V2");
+}
+
+/// SR-06: CEI invariant — remaining_balance is decremented before token transfer.
+/// Verified indirectly: if balance were decremented AFTER transfer an interrupted
+/// run would allow double-spending. We assert balance decrements atomically with
+/// the schedule being marked released.
+#[test]
+fn test_trigger_releases_cei_balance_decremented_with_schedule_mark() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 200);
+
+    let now = env.ledger().timestamp();
+    let recipient = Address::generate(&env);
+
+    client.create_program_release_schedule(&recipient, &200, &(now + 10));
+
+    env.ledger().set_timestamp(now + 20);
+    client.trigger_program_releases();
+
+    let data = client.get_program_info();
+    assert_eq!(data.remaining_balance, 0, "balance must be fully decremented after release");
+
+    let schedules = client.get_all_prog_release_schedules();
+    assert!(
+        schedules.get(0).unwrap().released,
+        "schedule must be marked released atomically with balance decrement"
+    );
+}

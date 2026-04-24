@@ -2241,6 +2241,13 @@ impl BountyEscrowContract {
             .unwrap_or(false)
     }
 
+    pub fn get_maintenance_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaintenanceModeSchemaVersion)
+            .unwrap_or(0)
+    }
+
     /// Update maintenance mode (admin only)
     pub fn set_maintenance_mode(
         env: Env,
