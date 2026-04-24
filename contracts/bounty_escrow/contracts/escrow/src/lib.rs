@@ -7060,7 +7060,7 @@ impl traits::EscrowInterface for BountyEscrowContract {
     /// Release funds to contributor through the trait interface
     fn release_funds(env: &Env, bounty_id: u64, contributor: Address) -> Result<(), crate::Error> {
         let _guard = NonReentrant::enter(&env);
-        Self::validate_claim_window(env.clone(), bounty_id)?;
+        BountyEscrowContract::validate_claim_window(env.clone(), bounty_id)?;
         let entrypoint: fn(Env, u64, Address) -> Result<(), crate::Error> =
             BountyEscrowContract::release_funds;
         entrypoint(env.clone(), bounty_id, contributor)

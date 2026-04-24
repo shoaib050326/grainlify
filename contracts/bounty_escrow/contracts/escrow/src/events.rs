@@ -1881,3 +1881,76 @@ pub fn emit_release_queue_cancelled(env: &Env, event: ReleaseQueueCancelled) {
     let topics = (symbol_short!("hv_cncl"), event.bounty_id);
     env.events().publish(topics, event);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLAIM-WINDOW EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when the admin sets (or updates) the global claim-window duration.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"clm_win"` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowSet {
+    pub version: u32,
+    /// New claim-window duration in seconds. `0` means enforcement is disabled.
+    pub claim_window: u64,
+    /// Admin who made the change.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+pub fn emit_claim_window_set(env: &Env, event: ClaimWindowSet) {
+    let topics = (symbol_short!("clm_win"),);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a claim is validated as within the active window.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"clm_ok"` |
+/// | 1 | `bounty_id: u64` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowValidated {
+    pub version: u32,
+    pub bounty_id: u64,
+    /// Current ledger timestamp.
+    pub now: u64,
+    /// Timestamp at which the claim window expires.
+    pub expires_at: u64,
+}
+
+pub fn emit_claim_window_validated(env: &Env, event: ClaimWindowValidated) {
+    let topics = (symbol_short!("clm_ok"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a claim is rejected because the claim window has expired.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"clm_exp"` |
+/// | 1 | `bounty_id: u64` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowExpired {
+    pub version: u32,
+    pub bounty_id: u64,
+    /// Current ledger timestamp.
+    pub now: u64,
+    /// Timestamp at which the claim window expired.
+    pub expires_at: u64,
+}
+
+pub fn emit_claim_window_expired(env: &Env, event: ClaimWindowExpired) {
+    let topics = (symbol_short!("clm_exp"), event.bounty_id);
+    env.events().publish(topics, event);
+}
